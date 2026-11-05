@@ -327,6 +327,68 @@ const _keepProxied = [
   'oaiusercontent.com',
 ];
 
+const _neverBlock = [
+  'google.com',
+  'google.cn',
+  'gstatic.com',
+  'googleapis.com',
+  'googleusercontent.com',
+  'recaptcha.net',
+  'youtube.com',
+  'ytimg.com',
+  'googlevideo.com',
+  'apple.com',
+  'icloud.com',
+  'microsoft.com',
+  'microsoftonline.com',
+  'live.com',
+  'office.com',
+  'bing.com',
+  'shopify.com',
+  'myshopify.com',
+  'shopifycdn.com',
+  'shopifysvc.com',
+  'shopline.com',
+  'myshopline.com',
+  'facebook.com',
+  'fbcdn.net',
+  'instagram.com',
+  'whatsapp.net',
+  'tiktok.com',
+  'x.com',
+  'twitter.com',
+  'telegram.org',
+  'paypal.com',
+  'stripe.com',
+  'stripe.network',
+  'alipay.com',
+  'qq.com',
+  'baidu.com',
+  'taobao.com',
+  'jd.com',
+  'amazon.com',
+  'amazonaws.com',
+  'cloudflare.com',
+  'cloudfront.net',
+  'akamaihd.net',
+  'akamaized.net',
+  'jsdelivr.net',
+  'unpkg.com',
+  'github.com',
+  'githubusercontent.com',
+  ..._keepProxied,
+];
+
+/// Blocking only ever takes a whole ad or tracking domain, never one a page or
+/// an account needs to work.
+bool aiCanBlock(String domain) {
+  final value = domain.toLowerCase();
+  if (InternetAddress.tryParse(value) != null || !value.contains('.')) {
+    return false;
+  }
+  return !_neverBlock.any((d) => value == d || value.endsWith('.$d'));
+}
+
 bool isLocalAddress(String address) {
   if (address.isEmpty || address == 'localhost') {
     return true;
@@ -402,6 +464,7 @@ AiProposedRule? validateAiRule(
   Map item, {
   required String proxyGroup,
   required Set<String> existing,
+  bool allowBlock = false,
 }) {
   final type = (item['type'] as String? ?? '').trim().toUpperCase();
   var value = (item['value'] as String? ?? '').trim();
@@ -410,6 +473,7 @@ AiProposedRule? validateAiRule(
       .toUpperCase()) {
     'DIRECT' => 'DIRECT',
     'PROXY' => proxyGroup,
+    'BLOCK' || 'REJECT' when allowBlock => 'REJECT',
     _ => null,
   };
   final reason = (item['reason'] as String? ?? '').trim();
@@ -420,6 +484,11 @@ AiProposedRule? validateAiRule(
     return null;
   }
   if (type != 'PROCESS-NAME' && value.contains(' ')) {
+    return null;
+  }
+  if (target == 'REJECT' &&
+      (!{'DOMAIN', 'DOMAIN-SUFFIX'}.contains(type) ||
+          !aiCanBlock(value.replaceFirst(RegExp(r'^\*?\.'), '')))) {
     return null;
   }
   switch (type) {
@@ -572,6 +641,34 @@ class AiClient {
   }
 }
 
+/// macOS process and domain words for the Chinese names people use for apps.
+const _appAliases = {
+  '企业微信': ['wework', 'wecom', '企业微信'],
+  '微信': ['wechat', 'weixin'],
+  'qq音乐': ['qqmusic'],
+  'qq': ['qq'],
+  '钉钉': ['dingtalk'],
+  '飞书': ['feishu', 'lark'],
+  '腾讯会议': ['wemeet', 'tencentmeeting'],
+  '腾讯视频': ['tencentvideo', 'qqlive'],
+  '百度网盘': ['baidunetdisk', 'baiduyun'],
+  '网易云音乐': ['neteasemusic', '163'],
+  '支付宝': ['alipay'],
+  '淘宝': ['taobao', 'alicdn'],
+  '千牛': ['qianniu', 'aliworkbench'],
+  '阿里旺旺': ['aliwangwang'],
+  '抖音': ['douyin'],
+  '剪映': ['videofusion', 'jianying'],
+  '哔哩哔哩': ['bilibili'],
+  'b站': ['bilibili'],
+  '小红书': ['xiaohongshu', 'xhs'],
+  '爱奇艺': ['iqiyi'],
+  '优酷': ['youku'],
+  '迅雷': ['thunder', 'xunlei'],
+  '向日葵': ['sunlogin', 'awesun', 'oray'],
+  '有道': ['youdao'],
+};
+
 class AiDiagnosis {
   static const _window = Duration(minutes: 5);
   static const _maxEvidence = 40;
@@ -613,14 +710,25 @@ class AiDiagnosis {
     return uri.replace(path: uri.path.isEmpty ? '/' : uri.path);
   }
 
-  bool _matchesKeyword(AiEvidence item) {
-    final terms = {
-      ...keyword
-          .toLowerCase()
-          .split(RegExp(r'[\s,，]+'))
-          .where((term) => term.isNotEmpty),
+  late final Set<String> _terms = () {
+    final text = keyword.toLowerCase();
+    final aliases = <String>{};
+    var rest = text;
+    for (final MapEntry(:key, :value) in _appAliases.entries) {
+      if (rest.contains(key)) {
+        aliases.addAll(value);
+        rest = rest.replaceAll(key, ' ');
+      }
+    }
+    return {
+      ...rest.split(RegExp(r'[\s,，、]+')).where((term) => term.isNotEmpty),
+      ...aliases,
       ?target?.host.toLowerCase(),
     };
+  }();
+
+  bool _matchesKeyword(AiEvidence item) {
+    final terms = _terms;
     return terms.any(
       (term) =>
           item.host.toLowerCase().contains(term) ||
@@ -731,6 +839,7 @@ Rules you return are inserted before all existing rules.
 Guidelines:
 - Fix only what explains the reported problem. No rules is better than a guess.
 - Problem "打不开": a host that fails or times out DIRECT but works through the proxy, or a well-known service blocked in China (Google, YouTube, Telegram, X/Twitter, Facebook, Instagram, WhatsApp, Discord, Reddit, GitHub raw content and the like), should go PROXY.
+- A Chinese app or site that does not work (WeChat/微信, QQ, WeCom/企业微信, DingTalk/钉钉, Feishu/飞书, Alipay, Taobao, Baidu and the like) must go DIRECT, never through the proxy: Chinese services often refuse or throttle foreign proxy IPs, and these apps connect to many bare IPs that domain rules miss. Propose PROCESS-NAME for the whole app, using the process name exactly as it appears in the connections (WeChat on macOS is "WeChat"), plus DOMAIN-SUFFIX for its main domains (weixin.qq.com, wechat.com, qq.com, qpic.cn, ...) when they are not already DIRECT.
 - Problem "太慢": a host whose DIRECT test succeeds and is clearly faster than the proxy should go DIRECT. That covers Chinese services and also servers in Hong Kong, Macau, Taiwan or nearby Asia that are not blocked in China (for example Alibaba Cloud or Tencent Cloud servers abroad): sending them through a far-away proxy only adds distance. A Chinese service (Chinese company, Chinese CDN, .cn domain, ipCountry CN) going through the proxy should go DIRECT even without a test. If DIRECT fails or times out, keep it on the proxy.
 - Prefer DOMAIN-SUFFIX on the registrable domain (taobao.com, alicdn.com) so related subdomains are covered. Use PROCESS-NAME only when a whole app should take one route and its process name appears in the data. Use DOMAIN-KEYWORD rarely. Use IP-CIDR (the single address as /32) only for hosts without a domain.
 - Never route openai.com, chatgpt.com, oaistatic.com or oaiusercontent.com DIRECT. Never add rules for private or LAN addresses.

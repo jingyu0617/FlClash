@@ -322,23 +322,47 @@ class AiTrafficLog with CoreEventListener {
   }
 }
 
+const aiCategoryLabels = {
+  'site': '你打开过的网站',
+  'ads': '广告和统计（网页后台自动加载的）',
+  'infra': '公共资源和服务（字体、加速、云服务）',
+  'ip': '看不出来源的 IP 地址',
+};
+
+String aiCategoryLabel(String category) => aiCategoryLabels[category] ?? '其他';
+
+String aiVerdictLabel(String verdict) => switch (verdict) {
+  'DIRECT' => '直连',
+  'PROXY' => '走代理',
+  'BLOCK' => '屏蔽',
+  _ => '保持原样',
+};
+
 class AiKnownSite {
   final String verdict;
   final String source;
   final String reason;
+  final String category;
+  final String about;
   final DateTime at;
 
   const AiKnownSite({
     required this.verdict,
     required this.source,
     required this.reason,
+    this.category = '',
+    this.about = '',
     required this.at,
   });
+
+  bool get byUser => source == 'user';
 
   factory AiKnownSite.fromJson(Map<String, Object?> json) => AiKnownSite(
     verdict: json['v'] as String? ?? 'KEEP',
     source: json['s'] as String? ?? 'ai',
     reason: json['r'] as String? ?? '',
+    category: json['c'] as String? ?? '',
+    about: json['a'] as String? ?? '',
     at: DateTime.tryParse(json['at'] as String? ?? '') ?? DateTime.now(),
   );
 
@@ -346,13 +370,19 @@ class AiKnownSite {
     'v': verdict,
     's': source,
     'r': reason,
+    if (category.isNotEmpty) 'c': category,
+    if (about.isNotEmpty) 'a': about,
     'at': at.toIso8601String(),
   };
 }
 
+enum AiPendingChoice { later, accept, decline, block }
+
 class AiPendingRule {
   final AiProposedRule rule;
   final String site;
+  final String category;
+  final String about;
   final int? direct;
   final int? proxy;
   final DateTime at;
@@ -360,10 +390,18 @@ class AiPendingRule {
   const AiPendingRule({
     required this.rule,
     required this.site,
+    this.category = '',
+    this.about = '',
     this.direct,
     this.proxy,
     required this.at,
   });
+
+  String get suggestion => rule.target == 'DIRECT'
+      ? '直连'
+      : rule.target == 'REJECT'
+      ? '屏蔽'
+      : '走代理';
 
   factory AiPendingRule.fromJson(Map<String, Object?> json) => AiPendingRule(
     rule: AiProposedRule(
@@ -373,6 +411,8 @@ class AiPendingRule {
       reason: json['reason'] as String? ?? '',
     ),
     site: json['site'] as String? ?? '',
+    category: json['category'] as String? ?? '',
+    about: json['about'] as String? ?? '',
     direct: (json['direct'] as num?)?.toInt(),
     proxy: (json['proxy'] as num?)?.toInt(),
     at: DateTime.tryParse(json['at'] as String? ?? '') ?? DateTime.now(),
@@ -384,6 +424,8 @@ class AiPendingRule {
     'target': rule.target,
     'reason': rule.reason,
     'site': site,
+    'category': category,
+    'about': about,
     'direct': direct,
     'proxy': proxy,
     'at': at.toIso8601String(),
@@ -418,7 +460,9 @@ class AiReport {
     if (unknown == 0) {
       return '没有新的未识别地址，一切正常。';
     }
-    return '检查了 $unknown 个新地址，自动加了 ${applied.length} 条规则，'
+    final blocked = applied.where((raw) => raw.endsWith(',REJECT')).length;
+    final routed = applied.length - blocked;
+    return '检查了 $unknown 个新地址：自动调整 $routed 个、屏蔽广告统计 $blocked 个，'
         '$pending 条等你确认。';
   }
 
@@ -592,11 +636,15 @@ class AiDaily {
   /// test made today says the same thing.
   static bool shouldAutoApply({
     required String verdict,
+    String category = '',
     required bool high,
     required bool sensitive,
     required int? directMs,
     required int? proxyMs,
   }) {
+    if (verdict == 'BLOCK') {
+      return high && category == 'ads';
+    }
     if (!high || sensitive) {
       return false;
     }
@@ -837,24 +885,29 @@ class AiDaily {
         }
         final verdict = (item['verdict'] as String? ?? '').toUpperCase();
         final reason = (item['reason'] as String? ?? '').trim();
+        final category = (item['category'] as String? ?? '').trim();
+        final about = (item['about'] as String? ?? '').trim();
         known[site.key] = AiKnownSite(
           verdict: verdict.isEmpty ? 'KEEP' : verdict,
           source: 'ai',
           reason: reason,
+          category: category,
+          about: about,
           at: now,
         );
-        if (verdict != 'DIRECT' && verdict != 'PROXY') {
+        if (!{'DIRECT', 'PROXY', 'BLOCK'}.contains(verdict)) {
           continue;
         }
         final rule = validateAiRule(
           {
-            'type': item['type'],
+            'type': verdict == 'BLOCK' ? 'DOMAIN-SUFFIX' : item['type'],
             'value': item['value'] ?? site.key,
             'target': verdict,
             'reason': reason,
           },
           proxyGroup: proxyGroup,
           existing: existing,
+          allowBlock: category == 'ads',
         );
         if (rule == null || pendingRaw.contains(rule.raw.toUpperCase())) {
           continue;
@@ -863,6 +916,7 @@ class AiDaily {
         final measured = measurements[site.key];
         final auto = shouldAutoApply(
           verdict: verdict,
+          category: category,
           high: (item['confidence'] as String? ?? '').toLowerCase() == 'high',
           sensitive: _sensitive.hasMatch(site.key),
           directMs: measured?.direct,
@@ -876,6 +930,8 @@ class AiDaily {
             AiPendingRule(
               rule: rule,
               site: site.key,
+              category: category,
+              about: about,
               direct: measured?.direct,
               proxy: measured?.proxy,
               at: now,
@@ -886,6 +942,7 @@ class AiDaily {
     }
 
     await _writeKnown(known);
+    state['proxyGroup'] = proxyGroup;
     if (toApply.isNotEmpty) {
       await applyRules(ref, toApply, tag: '每日体检');
     }
@@ -971,32 +1028,110 @@ class AiDaily {
     instance.changes.value++;
   }
 
-  Future<void> resolvePending(
-    WidgetRef ref, {
-    required List<AiPendingRule> accepted,
-    required List<AiPendingRule> declined,
-  }) async {
-    if (accepted.isNotEmpty) {
-      await applyRules(ref, [
-        for (final item in accepted) item.rule,
-      ], tag: '你确认的');
+  static String ruleValueOf(String raw) {
+    final parts = raw.split(',');
+    return parts.length > 1 ? parts[1].trim().toLowerCase() : '';
+  }
+
+  static String ruleTargetOf(String raw) {
+    final parts = raw.split(',');
+    return parts.length > 2 ? parts[2].trim() : '';
+  }
+
+  Future<String> proxyGroupFor(WidgetRef ref) async {
+    final saved = (await readState())['proxyGroup'] as String?;
+    if (saved != null && saved.isNotEmpty) {
+      return saved;
     }
-    if (declined.isNotEmpty) {
-      final known = await readKnown();
-      final now = DateTime.now();
-      for (final item in declined) {
-        known[item.site] = AiKnownSite(
-          verdict: 'KEEP',
-          source: 'user',
-          reason: '你没有采纳：${item.rule.raw}',
-          at: now,
-        );
-      }
-      await _writeKnown(known);
-    }
-    final done = {
-      for (final item in [...accepted, ...declined]) item.rule.raw,
+    return pickProxyGroup({}, [
+      for (final group in ref.read(groupsProvider)) group.name,
+    ]);
+  }
+
+  static AiProposedRule? _ruleFor(
+    String site,
+    String verdict,
+    String proxyGroup,
+    String reason,
+  ) {
+    final isIp = InternetAddress.tryParse(site) != null;
+    return validateAiRule(
+      {
+        'type': isIp ? 'IP-CIDR' : 'DOMAIN-SUFFIX',
+        'value': site,
+        'target': verdict,
+        'reason': reason,
+      },
+      proxyGroup: proxyGroup,
+      existing: const {},
+      allowBlock: true,
+    );
+  }
+
+  /// Takes off every rule the assistant added for [site].
+  Future<void> _removeRulesFor(WidgetRef ref, Set<String> sites) async {
+    final store = AiStore.instance;
+    final records = await store.loadRecords();
+    final removed = {
+      for (final record in records)
+        if (sites.contains(ruleValueOf(record.raw).replaceAll('/32', '')))
+          record.ruleId,
     };
+    if (removed.isEmpty) {
+      return;
+    }
+    ref.read(globalRulesProvider.notifier).delAll(removed);
+    await store.saveRecords([
+      for (final record in records)
+        if (!removed.contains(record.ruleId)) record,
+    ]);
+  }
+
+  Future<void> resolvePending(
+    WidgetRef ref,
+    Map<AiPendingRule, AiPendingChoice> choices,
+  ) async {
+    final known = await readKnown();
+    final now = DateTime.now();
+    final toApply = <AiProposedRule>[];
+    final done = <String>{};
+    for (final MapEntry(key: item, value: choice) in choices.entries) {
+      if (choice == AiPendingChoice.later) {
+        continue;
+      }
+      done.add(item.rule.raw);
+      final rule = switch (choice) {
+        AiPendingChoice.accept => item.rule,
+        AiPendingChoice.block => _ruleFor(item.site, 'BLOCK', '', '你选择屏蔽'),
+        _ => null,
+      };
+      if (rule != null) {
+        toApply.add(rule);
+      }
+      known[item.site] = AiKnownSite(
+        verdict: switch (choice) {
+          AiPendingChoice.accept =>
+            item.rule.target == 'DIRECT'
+                ? 'DIRECT'
+                : item.rule.target == 'REJECT'
+                ? 'BLOCK'
+                : 'PROXY',
+          AiPendingChoice.block => 'BLOCK',
+          _ => 'KEEP',
+        },
+        source: 'user',
+        reason: choice == AiPendingChoice.decline
+            ? '你没有采纳 AI 的建议（${item.suggestion}）'
+            : '你确认的',
+        category: item.category,
+        about: item.about,
+        at: now,
+      );
+    }
+    await _writeKnown(known);
+    if (toApply.isNotEmpty) {
+      await applyRules(ref, toApply, tag: '你确认的');
+    }
     final state = await readState();
     final pending = await readPending();
     state['pending'] = [
@@ -1004,6 +1139,121 @@ class AiDaily {
         if (!done.contains(item.rule.raw)) item.toJson(),
     ];
     await _writeState(state);
+  }
+
+  /// [verdict] is DIRECT, PROXY, BLOCK, KEEP, or FORGET to have the next
+  /// review judge the site again.
+  Future<void> changeSite(WidgetRef ref, String site, String verdict) async {
+    final known = await readKnown();
+    final previous = known[site];
+    await _removeRulesFor(ref, {site});
+    if (verdict == 'FORGET') {
+      known.remove(site);
+    } else {
+      if ({'DIRECT', 'PROXY', 'BLOCK'}.contains(verdict)) {
+        final rule = _ruleFor(
+          site,
+          verdict,
+          await proxyGroupFor(ref),
+          '你手动改成${aiVerdictLabel(verdict)}',
+        );
+        if (rule == null) {
+          throw AiException(
+            '$site 不能${aiVerdictLabel(verdict)}（可能是网页或账号必需的地址）。',
+          );
+        }
+        await applyRules(ref, [rule], tag: '你改的');
+      }
+      known[site] = AiKnownSite(
+        verdict: verdict,
+        source: 'user',
+        reason: '你手动改成${aiVerdictLabel(verdict)}',
+        category: previous?.category ?? '',
+        about: previous?.about ?? '',
+        at: DateTime.now(),
+      );
+    }
+    await _writeKnown(known);
+    changes.value++;
+  }
+
+  /// The sites the assistant blocked that connections hit since [since].
+  Future<Map<String, int>> blockedHits(
+    List<TrackerInfo> connections,
+    DateTime since,
+  ) async {
+    final blocked = {
+      for (final record in await AiStore.instance.loadRecords())
+        if (ruleTargetOf(record.raw) == 'REJECT') ruleValueOf(record.raw),
+    };
+    final hits = <String, int>{};
+    for (final info in connections) {
+      final outbound = info.chains.isEmpty ? '' : info.chains.first;
+      if (!outbound.startsWith('REJECT') || info.start.isBefore(since)) {
+        continue;
+      }
+      final host = info.metadata.host.toLowerCase();
+      for (final value in blocked) {
+        if (host == value || host.endsWith('.$value')) {
+          hits[value] = (hits[value] ?? 0) + 1;
+        }
+      }
+    }
+    return hits;
+  }
+
+  Future<({String summary, Set<String> picks})> askUnblock({
+    required String keyword,
+    required Map<String, int> hits,
+  }) async {
+    final settings = await AiStore.instance.loadSettings();
+    final known = await readKnown();
+    final answer = AiClient.parseJson(
+      await AiClient.ask(
+        settings,
+        system: '''
+The user blocked advertising and tracking domains in FlClash. A website now shows or works wrongly. You get the blocked domains that connections hit in the last minutes (with how many times, and what each one is) and the site the user names, if any.
+Pick the blocked domains most likely to break that site: things the page needs to show, play, log in, pay or load fonts and scripts. Pure ad, ad tracking and analytics domains rarely break a page. If unsure, include the domain: it is better to unblock a few too many.
+Reply with one JSON object only: {"summary": "1-2 句简体中文，说明你的判断", "unblock": ["domain", ...]}''',
+        user: jsonEncode({
+          'site': keyword.trim().isEmpty ? '（没有说是哪个网站）' : keyword.trim(),
+          'blockedHits': [
+            for (final entry in hits.entries)
+              {
+                'domain': entry.key,
+                'hits': entry.value,
+                if (known[entry.key]?.about case final about?
+                    when about.isNotEmpty)
+                  'about': about,
+              },
+          ],
+        }),
+      ),
+    );
+    final picks = {
+      for (final item in (answer['unblock'] as List?) ?? const [])
+        if (item is String && hits.containsKey(item.toLowerCase()))
+          item.toLowerCase(),
+    };
+    return (summary: (answer['summary'] as String? ?? '').trim(), picks: picks);
+  }
+
+  Future<void> unblock(WidgetRef ref, Set<String> sites) async {
+    await _removeRulesFor(ref, sites);
+    final known = await readKnown();
+    final now = DateTime.now();
+    for (final site in sites) {
+      known[site] = AiKnownSite(
+        verdict: 'KEEP',
+        source: 'user',
+        reason: '屏蔽后网页不正常，你恢复了',
+        category: known[site]?.category ?? 'ads',
+        about: known[site]?.about ?? '',
+        at: now,
+      );
+    }
+    await _writeKnown(known);
+    changes.value++;
   }
 
   String _systemPrompt(String proxyGroup, {required bool proxyUp}) =>
@@ -1015,11 +1265,15 @@ For each site you get: sample hosts, the apps that used it, outbound (DIRECT or 
 Decide for every site:
 - "DIRECT": DIRECT works and is clearly faster than the proxy, or it is a Chinese service (Chinese company, Chinese CDN, .cn, ipCountry CN). Servers in Hong Kong, Macau, Taiwan or nearby Asia that are not blocked in China usually belong here when the test agrees.
 - "PROXY": it went DIRECT but DIRECT fails or times out while the proxy works, or it is a service blocked in China (Google, YouTube, Telegram, X, Facebook, Instagram, WhatsApp, Discord, Reddit and the like).
+- "BLOCK": only for category "ads" (see below): the user chose to block advertising, ad tracking, analytics and telemetry beacons, and click-fraud scripts. Never BLOCK anything a page or an account needs to work: fonts, scripts and libraries, CDNs, images and video, captchas, logins, payments, shops, maps, chat.
 - "KEEP": leave it as it is: already routed right, unclear, or too minor to need a rule.
-confidence is "high" only when the test clearly supports the verdict. Use "low" for anything to do with payments, banking, logins or accounts, advertising platforms, shop admin panels, and whenever the test is missing or mixed: the user confirms those by hand.
+category, one of: "site" (a website or service the user opened on purpose), "ads" (advertising, ad tracking, analytics, telemetry, click-fraud detection), "infra" (shared resources and services pages load in the background: fonts, CDNs, cloud and API endpoints), "ip" (a bare IP whose purpose is unclear).
+about: one short plain Simplified Chinese sentence saying what the site is, for a non-technical reader (e.g. "谷歌的网页广告服务").
+For "BLOCK", confidence "high" when you are sure it is purely ads or tracking.
+For DIRECT and PROXY, confidence is "high" only when the test clearly supports the verdict. Use "low" for anything to do with payments, banking, logins or accounts, advertising platforms, shop admin panels, and whenever the test is missing or mixed: the user confirms those by hand.
 Rule shape: DOMAIN-SUFFIX on the site itself for domains, IP-CIDR with /32 for bare IPs. Never send openai.com, chatgpt.com, oaistatic.com or oaiusercontent.com DIRECT.
 The user only reads Simplified Chinese and is not technical: summary and reason in plain Simplified Chinese.
 
 Reply with one JSON object only, with a decision for every site:
-{"summary": "2-3 句简体中文，总结今天发现了什么", "decisions": [{"site": "example.com", "verdict": "DIRECT", "confidence": "high", "type": "DOMAIN-SUFFIX", "value": "example.com", "reason": "一句简体中文"}]}''';
+{"summary": "2-3 句简体中文，总结今天发现了什么", "decisions": [{"site": "example.com", "category": "site", "about": "一句简体中文：这是什么", "verdict": "DIRECT", "confidence": "high", "type": "DOMAIN-SUFFIX", "value": "example.com", "reason": "一句简体中文：为什么这样处理"}]}''';
 }

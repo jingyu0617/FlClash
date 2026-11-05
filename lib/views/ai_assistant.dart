@@ -103,23 +103,94 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
     if (_pending.isEmpty) {
       return;
     }
-    final accepted = await BaseNavigator.push<List<AiPendingRule>>(
-      context,
-      AiPendingView(pending: _pending),
-    );
-    if (accepted == null) {
+    final choices =
+        await BaseNavigator.push<Map<AiPendingRule, AiPendingChoice>>(
+          context,
+          AiPendingView(pending: _pending),
+        );
+    if (choices == null) {
       return;
     }
-    final acceptedRaw = {for (final item in accepted) item.rule.raw};
-    await AiDaily.instance.resolvePending(
-      ref,
-      accepted: accepted,
-      declined: [
-        for (final item in _pending)
-          if (!acceptedRaw.contains(item.rule.raw)) item,
-      ],
+    await AiDaily.instance.resolvePending(ref, choices);
+    final later = choices.values
+        .where((choice) => choice == AiPendingChoice.later)
+        .length;
+    dialogs.showBanner(later == 0 ? '已处理完。' : '已处理，还有 $later 条先放着，下次再定。');
+  }
+
+  Future<void> _diagnoseBroken() async {
+    if (_status != null) {
+      return;
+    }
+    if (!_settings.ready && !await _editKey()) {
+      return;
+    }
+    final keyword = await dialogs.showCommonDialog<String>(
+      child: const InputDialog(
+        title: '哪个网站显示不正常？',
+        value: '',
+        hintText: '例如：亚马逊、某个网址（不填也行）',
+      ),
     );
-    dialogs.showBanner('已采纳 ${accepted.length} 条，其余的不再提醒。');
+    if (keyword == null) {
+      return;
+    }
+    try {
+      _setStatus('正在找最近被屏蔽的地址…');
+      final daily = AiDaily.instance;
+      final live = await coreController.getConnections();
+      final hits = await daily.blockedHits([
+        ...ref.read(requestsProvider).list,
+        ...live,
+      ], DateTime.now().subtract(const Duration(minutes: 10)));
+      if (hits.isEmpty) {
+        _setStatus(null);
+        await dialogs.showAlert(
+          title: '不是屏蔽造成的',
+          message: const TextSpan(
+            text:
+                '最近 10 分钟没有连接被 AI 的屏蔽规则拦下，所以这次显示不正常应该不是屏蔽造成的。可以试试上面的「网站或软件打不开」。',
+          ),
+        );
+        return;
+      }
+      _setStatus('正在请 AI 判断是哪个屏蔽影响了网页…');
+      var summary = '';
+      var picks = hits.keys.toSet();
+      try {
+        final answer = await daily.askUnblock(keyword: keyword, hits: hits);
+        summary = answer.summary;
+        if (answer.picks.isNotEmpty) {
+          picks = answer.picks;
+        }
+      } catch (_) {
+        summary = 'AI 这次没回答上来，下面列出最近 10 分钟被屏蔽的全部地址，默认都勾上了。';
+      }
+      _setStatus(null);
+      if (!mounted) {
+        return;
+      }
+      final known = await daily.readKnown();
+      if (!mounted) {
+        return;
+      }
+      final selected = await BaseNavigator.push<Set<String>>(
+        context,
+        AiUnblockView(summary: summary, hits: hits, picks: picks, known: known),
+      );
+      if (selected == null || selected.isEmpty) {
+        return;
+      }
+      await daily.unblock(ref, selected);
+      await _load();
+      dialogs.showBanner('已恢复 ${selected.length} 个地址，刷新一下网页试试。');
+    } catch (error) {
+      _setStatus(null);
+      await dialogs.showAlert(
+        title: '没有完成',
+        message: TextSpan(text: error.toString()),
+      );
+    }
   }
 
   void _setStatus(String? status) {
@@ -316,6 +387,12 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
         subtitle: const Text('让 AI 找出绕了远路、应该直连的国内地址'),
         onTap: busy ? null : () => _diagnose(AiProblem.slow),
       ),
+      ListItem(
+        leading: const GlyphIcon(AppGlyphs.eyeOff),
+        title: const Text('网站显示不正常'),
+        subtitle: const Text('可能是屏蔽广告时误伤了，让 AI 找出来恢复'),
+        onTap: busy ? null : _diagnoseBroken,
+      ),
     ];
   }
 
@@ -347,8 +424,14 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
       ListItem(
         leading: const GlyphIcon(AppGlyphs.checkCircle),
         title: Text('等你确认的建议（${_pending.length}）'),
-        subtitle: Text(_pending.isEmpty ? '没有' : '点开逐条勾选，没勾的以后不再提醒'),
+        subtitle: Text(_pending.isEmpty ? '没有' : '每条可以选：采纳、不要、先放着'),
         onTap: _pending.isEmpty ? null : _openPending,
+      ),
+      ListItem(
+        leading: const GlyphIcon(AppGlyphs.layers),
+        title: const Text('已识别名单'),
+        subtitle: const Text('判断过的地址都在这里，可以随时改'),
+        onTap: () => BaseNavigator.push<void>(context, const AiKnownView()),
       ),
       ListItem(
         leading: running
@@ -545,6 +628,30 @@ class _AiProposalViewState extends State<AiProposalView> {
   }
 }
 
+String _testLabel(int? direct, int? proxy) =>
+    '测速：直连 ${AiMeasurement.label(direct)}，代理 ${AiMeasurement.label(proxy)}';
+
+List<MapEntry<String, List<T>>> _byCategory<T>(
+  Iterable<T> items,
+  String Function(T item) categoryOf,
+) {
+  final groups = <String, List<T>>{};
+  for (final item in items) {
+    final category = categoryOf(item);
+    groups
+        .putIfAbsent(
+          aiCategoryLabels.containsKey(category) ? category : '',
+          () => [],
+        )
+        .add(item);
+  }
+  const order = ['site', 'ads', 'infra', 'ip', ''];
+  return [
+    for (final key in order)
+      if (groups[key] case final list?) MapEntry(key, list),
+  ];
+}
+
 class AiPendingView extends StatefulWidget {
   final List<AiPendingRule> pending;
 
@@ -555,18 +662,38 @@ class AiPendingView extends StatefulWidget {
 }
 
 class _AiPendingViewState extends State<AiPendingView> {
-  final Set<int> _selected = {};
+  late final Map<AiPendingRule, AiPendingChoice> _choices = {
+    for (final item in widget.pending) item: AiPendingChoice.later,
+  };
+
+  List<AiPendingChoice> _optionsFor(AiPendingRule item) => [
+    AiPendingChoice.later,
+    AiPendingChoice.accept,
+    AiPendingChoice.decline,
+    if (item.rule.target != 'REJECT' &&
+        {'ads', ''}.contains(item.category) &&
+        aiCanBlock(item.site))
+      AiPendingChoice.block,
+  ];
+
+  String _label(AiPendingRule item, AiPendingChoice choice) => switch (choice) {
+    AiPendingChoice.later => '先放着',
+    AiPendingChoice.accept => '采纳：${item.suggestion}',
+    AiPendingChoice.decline => '不要，保持原样',
+    AiPendingChoice.block => '改成屏蔽',
+  };
 
   @override
   Widget build(BuildContext context) {
+    final groups = _byCategory(widget.pending, (item) => item.category);
     return Scaffold(
       title: '等你确认的建议',
       confirmationAction: IconButtonData(
         glyph: AppGlyphs.check,
-        tooltip: '采纳勾选的，其余不再提醒',
-        onPressed: () => Navigator.of(context).pop<List<AiPendingRule>>([
-          for (final index in _selected.toList()..sort()) widget.pending[index],
-        ]),
+        tooltip: '按选好的处理',
+        onPressed: () => Navigator.of(
+          context,
+        ).pop<Map<AiPendingRule, AiPendingChoice>>(_choices),
       ),
       body: ListView(
         padding: const EdgeInsets.symmetric(horizontal: 16).copyWith(
@@ -574,31 +701,235 @@ class _AiPendingViewState extends State<AiPendingView> {
           bottom: 20 + context.bottomInset,
         ),
         children: [
+          for (final MapEntry(key: category, value: items) in groups)
+            generateSection(
+              title: aiCategoryLabel(category),
+              items: [
+                for (final item in items)
+                  ListItem<AiPendingChoice>.options(
+                    title: Text('${item.site}（AI 建议${item.suggestion}）'),
+                    subtitle: Text(
+                      [
+                        if (item.about.isNotEmpty) item.about,
+                        item.rule.reason,
+                        _testLabel(item.direct, item.proxy),
+                      ].join('\n'),
+                    ),
+                    options: _optionsFor(item),
+                    value: _choices[item]!,
+                    textBuilder: (choice) => _label(item, choice),
+                    onChanged: (choice) =>
+                        setState(() => _choices[item] = choice),
+                  ),
+              ],
+            ),
           generateSection(
-            title: '勾选要采纳的',
+            items: const [
+              ListItem(
+                title: Text(
+                  '每条默认「先放着」，会留在这里下次再定。选好后点右上角 ✓。不管选了什么，以后都能在「已识别名单」里找到并改回来。',
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class AiKnownView extends ConsumerStatefulWidget {
+  const AiKnownView({super.key});
+
+  @override
+  ConsumerState<AiKnownView> createState() => _AiKnownViewState();
+}
+
+class _AiKnownViewState extends ConsumerState<AiKnownView> {
+  Map<String, AiKnownSite> _known = {};
+  String _query = '';
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load() async {
+    final known = await AiDaily.instance.readKnown();
+    if (mounted) {
+      setState(() => _known = known);
+    }
+  }
+
+  Future<void> _edit(String site, AiKnownSite item) async {
+    final canBlock = aiCanBlock(site);
+    final choice = await dialogs.showCommonDialog<String>(
+      child: Builder(
+        builder: (context) => AlertDialog(
+          title: site,
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消'),
+            ),
+            for (final verdict in [
+              'DIRECT',
+              'PROXY',
+              if (canBlock) 'BLOCK',
+              'KEEP',
+            ])
+              if (verdict != item.verdict)
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(verdict),
+                  child: Text('改成${aiVerdictLabel(verdict)}'),
+                ),
+            TextButton(
+              onPressed: () => Navigator.of(context).pop('FORGET'),
+              child: const Text('移出名单，下次重新判断'),
+            ),
+          ],
+          child: Text(
+            [
+              if (item.about.isNotEmpty) item.about,
+              '现在：${aiVerdictLabel(item.verdict)}（${item.byUser ? '你定的' : 'AI 判断'}）',
+              if (item.reason.isNotEmpty) item.reason,
+            ].join('\n'),
+          ),
+        ),
+      ),
+    );
+    if (choice == null) {
+      return;
+    }
+    try {
+      await AiDaily.instance.changeSite(ref, site, choice);
+    } catch (error) {
+      await dialogs.showAlert(message: TextSpan(text: error.toString()));
+    }
+    await _load();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final query = _query.trim().toLowerCase();
+    final entries =
+        _known.entries
+            .where(
+              (entry) =>
+                  query.isEmpty ||
+                  entry.key.contains(query) ||
+                  entry.value.about.contains(query),
+            )
+            .toList()
+          ..sort((a, b) => b.value.at.compareTo(a.value.at));
+    final groups = _byCategory(entries, (entry) => entry.value.category);
+    return Scaffold(
+      title: '已识别名单（${_known.length}）',
+      searchState: AppBarSearchState(
+        onSearch: (value) => setState(() => _query = value),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.symmetric(horizontal: 16).copyWith(
+          top: context.sectionsTopPadding,
+          bottom: 20 + context.bottomInset,
+        ),
+        children: [
+          if (entries.isEmpty)
+            generateSection(items: const [ListItem(title: Text('还没有判断过的地址'))]),
+          for (final MapEntry(key: category, value: items) in groups)
+            generateSection(
+              title: '${aiCategoryLabel(category)}（${items.length}）',
+              items: [
+                for (final MapEntry(key: site, value: item) in items)
+                  ListItem(
+                    title: Text('$site → ${aiVerdictLabel(item.verdict)}'),
+                    subtitle: Text(
+                      [
+                        if (item.about.isNotEmpty) item.about,
+                        '${item.byUser ? '你定的' : 'AI 判断'} · ${_AiAssistantViewState._date(item.at)}',
+                      ].join('\n'),
+                    ),
+                    onTap: () => _edit(site, item),
+                  ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class AiUnblockView extends StatefulWidget {
+  final String summary;
+  final Map<String, int> hits;
+  final Set<String> picks;
+  final Map<String, AiKnownSite> known;
+
+  const AiUnblockView({
+    super.key,
+    required this.summary,
+    required this.hits,
+    required this.picks,
+    required this.known,
+  });
+
+  @override
+  State<AiUnblockView> createState() => _AiUnblockViewState();
+}
+
+class _AiUnblockViewState extends State<AiUnblockView> {
+  late final Set<String> _selected = {...widget.picks};
+
+  @override
+  Widget build(BuildContext context) {
+    final sites = widget.hits.keys.toList()
+      ..sort((a, b) => widget.hits[b]!.compareTo(widget.hits[a]!));
+    return Scaffold(
+      title: '恢复被屏蔽的地址',
+      confirmationAction: IconButtonData(
+        glyph: AppGlyphs.check,
+        tooltip: '恢复勾选的',
+        onPressed: _selected.isEmpty
+            ? null
+            : () => Navigator.of(context).pop<Set<String>>(_selected),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.symmetric(horizontal: 16).copyWith(
+          top: context.sectionsTopPadding,
+          bottom: 20 + context.bottomInset,
+        ),
+        children: [
+          if (widget.summary.isNotEmpty)
+            generateSection(
+              title: 'AI 的判断',
+              items: [ListItem(title: Text(widget.summary))],
+            ),
+          generateSection(
+            title: '最近 10 分钟被屏蔽的地址',
             items: [
-              for (final (index, item) in widget.pending.indexed)
+              for (final site in sites)
                 ListItem.checkbox(
                   title: Text(
-                    '${item.rule.value} → '
-                    '${item.rule.target == 'DIRECT' ? '直连' : '走代理'}',
+                    '$site（拦了 ${widget.hits[site]} 次）'
+                    '${widget.picks.contains(site) ? ' · AI 建议恢复' : ''}',
                   ),
                   subtitle: Text(
-                    '${item.rule.reason}\n'
-                    '测速：直连 ${AiMeasurement.label(item.direct)}，'
-                    '代理 ${AiMeasurement.label(item.proxy)}',
+                    widget.known[site]?.about.isNotEmpty == true
+                        ? widget.known[site]!.about
+                        : '没有说明',
                   ),
-                  value: _selected.contains(index),
+                  value: _selected.contains(site),
                   onChanged: (value) => setState(() {
                     if (value == true) {
-                      _selected.add(index);
+                      _selected.add(site);
                     } else {
-                      _selected.remove(index);
+                      _selected.remove(site);
                     }
                   }),
                 ),
             ],
-            footer: '点右上角 ✓：勾选的马上生效；没勾的记为「保持原样」，以后体检不再问。直接返回则什么都不改。',
+            footer: '恢复后这个地址不再屏蔽，也不会再被自动屏蔽。点右上角 ✓ 生效，然后刷新网页。',
           ),
         ],
       ),
