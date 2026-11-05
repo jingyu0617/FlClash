@@ -1,0 +1,89 @@
+name: ai-release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ai-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: '3.47.6'
+  GO_VERSION: '1.27.1'
+
+jobs:
+  macos:
+    name: macOS arm64
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Setup Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.3.app || sudo xcode-select -s /Applications/Xcode_26.2.app
+          xcodebuild -version
+
+      - name: Get Flutter Dependency
+        run: |
+          flutter --version
+          flutter pub get
+
+      - name: Fetch CA certificates
+        env:
+          CA_BUNDLE: cacert-2026-09-25.pem
+          CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
+        run: |
+          bundle=core/Clash.Meta/component/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          echo "$CA_BUNDLE_SHA256  $bundle" | shasum -a 256 -c -
+
+      - name: Build
+        run: dart setup.dart macos --env stable -v
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version: \([^+]*\).*/\1/p' pubspec.yaml)
+          tag="v$version"
+          notes=$(cat <<'EOF'
+          FlClash 加上「AI 分流助手」的版本（工具 → AI 分流助手）。
+
+          安装：
+          1. 先退出正在运行的 FlClash（菜单栏图标 → 退出）。
+          2. 打开下面的 dmg，把 FlClash 拖进「应用程序」，选择替换。原来的配置和节点都会保留。
+          3. 如果提示「无法验证开发者」或「已损坏」：打开「终端」，运行
+             xattr -cr /Applications/FlClash.app
+             然后再打开。
+          EOF
+          )
+          gh release delete "$tag" --cleanup-tag -y || true
+          git push origin ":refs/tags/$tag" || true
+          dmgs=$(find dist -name '*.dmg')
+          test -n "$dmgs"
+          gh release create "$tag" $dmgs \
+            --target "$GITHUB_SHA" \
+            --title "FlClash AI $version" \
+            --notes "$notes"

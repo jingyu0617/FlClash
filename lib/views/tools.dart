@@ -6,6 +6,7 @@ import 'package:fl_clash/providers/providers.dart';
 import 'package:fl_clash/ui/icons/icons.dart';
 import 'package:fl_clash/views/about.dart';
 import 'package:fl_clash/views/access.dart';
+import 'package:fl_clash/views/ai_assistant.dart';
 import 'package:fl_clash/views/backup_and_restore.dart';
 import 'package:fl_clash/views/config/general.dart';
 import 'package:fl_clash/views/hotkey.dart';
@@ -50,6 +51,7 @@ class _ToolViewState extends ConsumerState<ToolsView> {
     return generateSection(
       title: context.appLocalizations.settings,
       items: [
+        const AiAssistantItem(),
         const _LocaleItem(),
         const _ThemeItem(),
         if (system.isDesktop) const _HotkeyItem(),
