@@ -105,7 +105,7 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
       child: const InputDialog(
         title: '是哪个网站或软件？',
         value: '',
-        hintText: '例如：淘宝、Telegram（不填也行）',
+        hintText: '例如：淘宝、Telegram，或直接填网址（不填也行）',
       ),
     );
     if (keyword == null) {
@@ -121,11 +121,12 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
       );
       final live = await coreController.getConnections();
       final count = diagnosis.collect(ref.read(requestsProvider).list, live);
-      if (count == 0) {
+      if (count == 0 && diagnosis.target == null) {
         _setStatus(null);
         await dialogs.showAlert(
           message: const TextSpan(
-            text: '最近 5 分钟没有抓到连接记录。请先打开出问题的网站或软件，等几秒钟再来点。',
+            text:
+                '最近 5 分钟没有抓到连接记录。请先打开出问题的网站或软件，等几秒钟再来点；或者直接填网址，比如 http://1.2.3.4/。',
           ),
         );
         return;
@@ -147,9 +148,18 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
         return;
       }
       if (proposal.rules.isEmpty) {
+        final tests = [
+          for (final item in proposal.measurements.take(3))
+            '${item.host}：直连 ${AiMeasurement.label(item.direct)}，代理 ${AiMeasurement.label(item.proxy)}',
+        ];
         await dialogs.showAlert(
           title: 'AI 的结论',
-          message: TextSpan(text: proposal.summary),
+          message: TextSpan(
+            text: [
+              proposal.summary,
+              if (tests.isNotEmpty) '\n测速：\n${tests.join('\n')}',
+            ].join('\n'),
+          ),
         );
         return;
       }

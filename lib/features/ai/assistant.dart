@@ -345,6 +345,26 @@ class AiDiagnosis {
 
   late final List<AiEvidence> _evidence;
   late final String _proxyGroup;
+  late final Uri? target = _targetOf(keyword);
+
+  /// What the user typed, when it names a site: a URL, a domain or an IP.
+  static Uri? _targetOf(String keyword) {
+    final text = keyword.trim();
+    if (text.isEmpty || text.contains(RegExp(r'\s'))) {
+      return null;
+    }
+    final isIp = InternetAddress.tryParse(text) != null;
+    final uri = Uri.tryParse(
+      text.contains('://') ? text : '${isIp ? 'http' : 'https'}://$text',
+    );
+    if (uri == null ||
+        !{'http', 'https'}.contains(uri.scheme) ||
+        !uri.host.contains('.') ||
+        _isLocal(uri.host)) {
+      return null;
+    }
+    return uri.replace(path: uri.path.isEmpty ? '/' : uri.path);
+  }
 
   static bool _isLocal(String address) {
     if (address.isEmpty || address == 'localhost') {
@@ -369,13 +389,17 @@ class AiDiagnosis {
   }
 
   bool _matchesKeyword(AiEvidence item) {
-    final terms = keyword
-        .toLowerCase()
-        .split(RegExp(r'[\s,，]+'))
-        .where((term) => term.isNotEmpty);
+    final terms = {
+      ...keyword
+          .toLowerCase()
+          .split(RegExp(r'[\s,，]+'))
+          .where((term) => term.isNotEmpty),
+      ?target?.host.toLowerCase(),
+    };
     return terms.any(
       (term) =>
           item.host.toLowerCase().contains(term) ||
+          item.ip == term ||
           item.process.toLowerCase().contains(term),
     );
   }
@@ -455,11 +479,16 @@ class AiDiagnosis {
 
   String get proxyGroup => _proxyGroup;
 
+  // A bare IP has no certificate to match, so its TLS port is asked in plain
+  // HTTP: the error page a TLS server sends back still times the round trip.
   static String _testUrl(AiEvidence item) {
+    final address = item.host.isNotEmpty ? item.host : item.ip;
+    final isIp = InternetAddress.tryParse(address) != null;
     return switch (item.port) {
-      '80' => 'http://${item.host}/',
-      '' || '443' => 'https://${item.host}/',
-      _ => 'https://${item.host}:${item.port}/',
+      '80' => 'http://$address/',
+      '' || '443' when isIp => 'http://$address:443/',
+      '' || '443' => 'https://$address/',
+      _ => '${isIp ? 'http' : 'https'}://$address:${item.port}/',
     };
   }
 
@@ -474,28 +503,23 @@ class AiDiagnosis {
     }
   }
 
+  Future<AiMeasurement> _measure(String label, String url) async {
+    final results = await Future.wait([
+      _delay('DIRECT', url),
+      _delay(_proxyGroup, url),
+    ]);
+    return AiMeasurement(host: label, direct: results[0], proxy: results[1]);
+  }
+
   Future<List<AiMeasurement>> measure() {
-    final targets = _evidence
-        .where(
-          (item) =>
-              item.host.isNotEmpty &&
-              InternetAddress.tryParse(item.host) == null,
-        )
-        .take(_maxMeasured);
+    final target = this.target;
+    final targetHost = target?.host.toLowerCase();
+    final evidence = _evidence
+        .where((item) => item.key.isNotEmpty && item.key != targetHost)
+        .take(target == null ? _maxMeasured : _maxMeasured - 1);
     return Future.wait([
-      for (final item in targets)
-        () async {
-          final url = _testUrl(item);
-          final results = await Future.wait([
-            _delay('DIRECT', url),
-            _delay(_proxyGroup, url),
-          ]);
-          return AiMeasurement(
-            host: item.host,
-            direct: results[0],
-            proxy: results[1],
-          );
-        }(),
+      if (target != null) _measure(target.authority, target.toString()),
+      for (final item in evidence) _measure(item.key, _testUrl(item)),
     ]);
   }
 
@@ -504,14 +528,15 @@ class AiDiagnosis {
 You are the routing assistant built into FlClash (a mihomo / Clash Meta client) on a Mac in mainland China.
 Chinese websites and apps should go DIRECT. Sites blocked in China or hosted abroad should go through the proxy group "$_proxyGroup".
 The user reports: ${problem.description}.
-You receive the recent connections (matchedRule = the rule that routed it, outbound = DIRECT or a proxy node) and a reachability test of the main hosts, measured DIRECT and through the proxy: milliseconds, -1 = timeout, -2 = failed, null = not tested.
+You receive the recent connections (matchedRule = the rule that routed it, outbound = DIRECT or a proxy node, ipCountry = where the server is) and a reachability test of the main hosts, measured DIRECT and through the proxy: milliseconds, -1 = timeout, -2 = failed, null = not tested.
+When the user named a site (userTarget), its test result comes first in reachability and it is the one to fix; the measurement already answers whether DIRECT is faster, so decide from it instead of asking the user to test.
 Rules you return are inserted before all existing rules.
 
 Guidelines:
 - Fix only what explains the reported problem. No rules is better than a guess.
 - Problem "打不开": a host that fails or times out DIRECT but works through the proxy, or a well-known service blocked in China (Google, YouTube, Telegram, X/Twitter, Facebook, Instagram, WhatsApp, Discord, Reddit, GitHub raw content and the like), should go PROXY.
-- Problem "太慢": a Chinese service (Chinese company, Chinese CDN, .cn domain, ipCountry CN) that currently goes through the proxy, or whose DIRECT test is clearly faster, should go DIRECT.
-- Prefer DOMAIN-SUFFIX on the registrable domain (taobao.com, alicdn.com) so related subdomains are covered. Use PROCESS-NAME only when a whole app should take one route and its process name appears in the data. Use DOMAIN-KEYWORD rarely. Use IP-CIDR only for hosts without a domain.
+- Problem "太慢": a host whose DIRECT test succeeds and is clearly faster than the proxy should go DIRECT. That covers Chinese services and also servers in Hong Kong, Macau, Taiwan or nearby Asia that are not blocked in China (for example Alibaba Cloud or Tencent Cloud servers abroad): sending them through a far-away proxy only adds distance. A Chinese service (Chinese company, Chinese CDN, .cn domain, ipCountry CN) going through the proxy should go DIRECT even without a test. If DIRECT fails or times out, keep it on the proxy.
+- Prefer DOMAIN-SUFFIX on the registrable domain (taobao.com, alicdn.com) so related subdomains are covered. Use PROCESS-NAME only when a whole app should take one route and its process name appears in the data. Use DOMAIN-KEYWORD rarely. Use IP-CIDR (the single address as /32) only for hosts without a domain.
 - Never route openai.com, chatgpt.com, oaistatic.com or oaiusercontent.com DIRECT. Never add rules for private or LAN addresses.
 - If the proxy test fails for nearly every host, the proxy server itself is down: return no rules and say so.
 - Skip hosts that are already routed correctly.
@@ -688,6 +713,7 @@ Reply with one JSON object only:
     final userContent = jsonEncode({
       'problem': problem.description,
       'userSays': keyword.trim().isEmpty ? '（没有指明）' : keyword.trim(),
+      'userTarget': ?target?.toString(),
       'outboundMode': mode,
       'proxyGroup': _proxyGroup,
       'connections': [for (final item in _evidence) item.toJson(now)],
