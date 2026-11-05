@@ -4,6 +4,7 @@ import 'package:fl_clash/common/common.dart';
 import 'package:fl_clash/core/controller.dart';
 import 'package:fl_clash/enum/enum.dart';
 import 'package:fl_clash/features/ai/assistant.dart';
+import 'package:fl_clash/features/ai/daily.dart';
 import 'package:fl_clash/models/models.dart';
 import 'package:fl_clash/providers/providers.dart';
 import 'package:fl_clash/ui/icons/icons.dart';
@@ -35,24 +36,90 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
   final _store = AiStore.instance;
   AiSettings _settings = const AiSettings();
   List<AiRuleRecord> _records = [];
+  bool _dailyEnabled = true;
+  List<AiPendingRule> _pending = [];
+  List<AiReport> _reports = [];
   String? _status;
 
   @override
   void initState() {
     super.initState();
+    AiDaily.instance.changes.addListener(_onDailyChanged);
     unawaited(_load());
   }
 
+  @override
+  void dispose() {
+    AiDaily.instance.changes.removeListener(_onDailyChanged);
+    super.dispose();
+  }
+
+  void _onDailyChanged() => unawaited(_load());
+
   Future<void> _load() async {
+    final daily = AiDaily.instance;
     final settings = await _store.loadSettings();
     final records = await _store.loadRecords();
+    final enabled = await daily.isEnabled();
+    final pending = await daily.readPending();
+    final reports = await daily.readReports();
     if (!mounted) {
       return;
     }
     setState(() {
       _settings = settings;
       _records = records;
+      _dailyEnabled = enabled;
+      _pending = pending;
+      _reports = reports;
     });
+  }
+
+  Future<void> _runDaily() async {
+    if (AiDaily.instance.running || _status != null) {
+      return;
+    }
+    if (!_settings.ready && !await _editKey()) {
+      return;
+    }
+    _setStatus('正在体检：整理日志、测速、请 AI 判断…（地址多的话要一两分钟）');
+    try {
+      final report = await AiDaily.instance.run(ref, manual: true);
+      _setStatus(null);
+      if (report != null && mounted) {
+        await BaseNavigator.push<void>(context, AiReportView(report: report));
+      }
+    } catch (error) {
+      _setStatus(null);
+      await AiDaily.instance.recordFailure(error);
+      await dialogs.showAlert(
+        title: '体检没有完成',
+        message: TextSpan(text: error.toString()),
+      );
+    }
+  }
+
+  Future<void> _openPending() async {
+    if (_pending.isEmpty) {
+      return;
+    }
+    final accepted = await BaseNavigator.push<List<AiPendingRule>>(
+      context,
+      AiPendingView(pending: _pending),
+    );
+    if (accepted == null) {
+      return;
+    }
+    final acceptedRaw = {for (final item in accepted) item.rule.raw};
+    await AiDaily.instance.resolvePending(
+      ref,
+      accepted: accepted,
+      declined: [
+        for (final item in _pending)
+          if (!acceptedRaw.contains(item.rule.raw)) item,
+      ],
+    );
+    dialogs.showBanner('已采纳 ${accepted.length} 条，其余的不再提醒。');
   }
 
   void _setStatus(String? status) {
@@ -184,20 +251,7 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
     List<AiProposedRule> selected,
     List<TrackerInfo> live,
   ) async {
-    final rules = [for (final item in selected) Rule.parse(item.raw)];
-    ref.read(globalRulesProvider.notifier).putAll(rules);
-    final now = DateTime.now();
-    _records = [
-      for (final (index, item) in selected.indexed)
-        AiRuleRecord(
-          ruleId: rules[index].id,
-          raw: item.raw,
-          reason: item.reason,
-          addedAt: now,
-        ),
-      ..._records,
-    ];
-    await _store.saveRecords(_records);
+    await AiDaily.applyRules(ref, selected, tag: '急用');
     await Future<void>.delayed(const Duration(seconds: 2));
     for (final info in live) {
       if (selected.any((rule) => rule.matches(info))) {
@@ -207,7 +261,7 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
     if (mounted) {
       setState(() {});
     }
-    dialogs.showBanner('已添加 ${rules.length} 条规则，马上生效。刷新一下网页或重开软件试试。');
+    dialogs.showBanner('已添加 ${selected.length} 条规则，马上生效。刷新一下网页或重开软件试试。');
   }
 
   Future<void> _undo(AiRuleRecord record) async {
@@ -221,11 +275,12 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
       return;
     }
     ref.read(globalRulesProvider.notifier).delAll({record.ruleId});
-    _records = _records.where((item) => item.ruleId != record.ruleId).toList();
-    await _store.saveRecords(_records);
-    if (mounted) {
-      setState(() {});
-    }
+    final records = await _store.loadRecords();
+    await _store.saveRecords([
+      for (final item in records)
+        if (item.ruleId != record.ruleId) item,
+    ]);
+    await _load();
   }
 
   static String _date(DateTime time) {
@@ -260,6 +315,48 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
         title: const Text('网站或软件太慢'),
         subtitle: const Text('让 AI 找出绕了远路、应该直连的国内地址'),
         onTap: busy ? null : () => _diagnose(AiProblem.slow),
+      ),
+    ];
+  }
+
+  List<Widget> _buildDailyItems() {
+    final last = _reports.firstOrNull;
+    final running = AiDaily.instance.running;
+    return [
+      ListItem.toggle(
+        leading: const GlyphIcon(AppGlyphs.clock),
+        title: const Text('每天自动体检'),
+        subtitle: const Text('晚上 11:30；那时合盖的话，下次打开电脑时补上'),
+        value: _dailyEnabled,
+        onChanged: (value) async {
+          await AiDaily.instance.setEnabled(value);
+          await _load();
+        },
+      ),
+      ListItem(
+        leading: const GlyphIcon(AppGlyphs.info),
+        title: const Text('最近一次体检'),
+        subtitle: Text(
+          last == null ? '还没有体检过' : '${_date(last.at)} · ${last.headline}',
+        ),
+        onTap: last == null
+            ? null
+            : () =>
+                  BaseNavigator.push<void>(context, AiReportView(report: last)),
+      ),
+      ListItem(
+        leading: const GlyphIcon(AppGlyphs.checkCircle),
+        title: Text('等你确认的建议（${_pending.length}）'),
+        subtitle: Text(_pending.isEmpty ? '没有' : '点开逐条勾选，没勾的以后不再提醒'),
+        onTap: _pending.isEmpty ? null : _openPending,
+      ),
+      ListItem(
+        leading: running
+            ? const ActivityIndicator(size: 20)
+            : const GlyphIcon(AppGlyphs.sync),
+        title: const Text('现在体检一次'),
+        subtitle: const Text('分析最近几天记录里还没识别的地址'),
+        onTap: running || _status != null ? null : _runDaily,
       ),
     ];
   }
@@ -299,7 +396,13 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
         ),
         children: [
           generateSection(
-            title: '遇到问题',
+            title: '每日体检',
+            items: _buildDailyItems(),
+            footer:
+                '软件会把每天的连接记成日志（只存在这台电脑，保留 30 天）。体检时只看还没被规则管到、也没判断过的新地址，测速后交给 AI：有把握的直接生效，涉及支付、登录、广告后台或测速不明确的留给你确认。今天已记录 ${AiTrafficLog.instance.todayHosts} 个地址。',
+          ),
+          generateSection(
+            title: '急用：现在就查',
             items: _buildProblemItems(mode),
             footer: '先打开出问题的网站或软件，再点上面的按钮。AI 会先测速再给建议，你确认后才会生效。',
           ),
@@ -435,6 +538,111 @@ class _AiProposalViewState extends State<AiProposalView> {
                     ),
                   ),
               ],
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class AiPendingView extends StatefulWidget {
+  final List<AiPendingRule> pending;
+
+  const AiPendingView({super.key, required this.pending});
+
+  @override
+  State<AiPendingView> createState() => _AiPendingViewState();
+}
+
+class _AiPendingViewState extends State<AiPendingView> {
+  final Set<int> _selected = {};
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      title: '等你确认的建议',
+      confirmationAction: IconButtonData(
+        glyph: AppGlyphs.check,
+        tooltip: '采纳勾选的，其余不再提醒',
+        onPressed: () => Navigator.of(context).pop<List<AiPendingRule>>([
+          for (final index in _selected.toList()..sort()) widget.pending[index],
+        ]),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.symmetric(horizontal: 16).copyWith(
+          top: context.sectionsTopPadding,
+          bottom: 20 + context.bottomInset,
+        ),
+        children: [
+          generateSection(
+            title: '勾选要采纳的',
+            items: [
+              for (final (index, item) in widget.pending.indexed)
+                ListItem.checkbox(
+                  title: Text(
+                    '${item.rule.value} → '
+                    '${item.rule.target == 'DIRECT' ? '直连' : '走代理'}',
+                  ),
+                  subtitle: Text(
+                    '${item.rule.reason}\n'
+                    '测速：直连 ${AiMeasurement.label(item.direct)}，'
+                    '代理 ${AiMeasurement.label(item.proxy)}',
+                  ),
+                  value: _selected.contains(index),
+                  onChanged: (value) => setState(() {
+                    if (value == true) {
+                      _selected.add(index);
+                    } else {
+                      _selected.remove(index);
+                    }
+                  }),
+                ),
+            ],
+            footer: '点右上角 ✓：勾选的马上生效；没勾的记为「保持原样」，以后体检不再问。直接返回则什么都不改。',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class AiReportView extends StatelessWidget {
+  final AiReport report;
+
+  const AiReportView({super.key, required this.report});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      title: '体检报告',
+      body: ListView(
+        padding: const EdgeInsets.symmetric(horizontal: 16).copyWith(
+          top: context.sectionsTopPadding,
+          bottom: 20 + context.bottomInset,
+        ),
+        children: [
+          generateSection(
+            title: _AiAssistantViewState._date(report.at),
+            items: [
+              ListItem(title: Text(report.headline)),
+              if (report.summary.isNotEmpty)
+                ListItem(title: Text(report.summary)),
+              ListItem(
+                title: const Text('数据'),
+                subtitle: Text(
+                  '日志里共 ${report.hosts} 个地址，其中 ${report.unknown} 个是新的未识别地址，'
+                  '测速 ${report.measured} 个。',
+                ),
+              ),
+            ],
+          ),
+          if (report.applied.isNotEmpty)
+            generateSection(
+              title: '自动生效的规则',
+              items: [
+                for (final raw in report.applied) ListItem(title: Text(raw)),
+              ],
+              footer: '不对的话，回到 AI 分流助手页面，在「AI 添加的规则」里点一下就能撤销。',
             ),
         ],
       ),

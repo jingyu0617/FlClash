@@ -7,6 +7,7 @@ import 'package:fl_clash/common/common.dart';
 import 'package:fl_clash/common/system_dns.dart';
 import 'package:fl_clash/common/window.dart';
 import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/features/ai/daily_manager.dart';
 import 'package:fl_clash/l10n/l10n.dart';
 import 'package:fl_clash/manager/hotkey_manager.dart';
 import 'package:fl_clash/manager/manager.dart';
@@ -43,7 +44,9 @@ Widget buildManagerStack({
       ? WindowManager(
           terminateSignals: terminateSignals,
           child: TrayManager(
-            child: HotKeyManager(child: ProxyManager(child: state)),
+            child: HotKeyManager(
+              child: ProxyManager(child: AiDailyManager(child: state)),
+            ),
           ),
         )
       : AndroidManager(child: TileManager(child: state));

@@ -312,24 +312,271 @@ class AiProposal {
   });
 }
 
+const aiAllowedRuleTypes = {
+  'DOMAIN',
+  'DOMAIN-SUFFIX',
+  'DOMAIN-KEYWORD',
+  'PROCESS-NAME',
+  'IP-CIDR',
+};
+
+const _keepProxied = [
+  'openai.com',
+  'chatgpt.com',
+  'oaistatic.com',
+  'oaiusercontent.com',
+];
+
+bool isLocalAddress(String address) {
+  if (address.isEmpty || address == 'localhost') {
+    return true;
+  }
+  final ip = InternetAddress.tryParse(address);
+  if (ip == null) {
+    return false;
+  }
+  if (ip.isLoopback || ip.isLinkLocal) {
+    return true;
+  }
+  final b = ip.rawAddress;
+  if (ip.type == InternetAddressType.IPv4) {
+    return b[0] == 10 ||
+        (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
+        (b[0] == 192 && b[1] == 168) ||
+        (b[0] == 198 && (b[1] == 18 || b[1] == 19)) ||
+        (b[0] == 100 && b[1] >= 64 && b[1] <= 127);
+  }
+  return (b[0] & 0xfe) == 0xfc;
+}
+
+// A bare IP has no certificate to match, so its TLS port is asked in plain
+// HTTP: the error page a TLS server sends back still times the round trip.
+String aiTestUrl(String address, String port) {
+  final isIp = InternetAddress.tryParse(address) != null;
+  return switch (port) {
+    '80' => 'http://$address/',
+    '' || '443' when isIp => 'http://$address:443/',
+    '' || '443' => 'https://$address/',
+    _ => '${isIp ? 'http' : 'https'}://$address:$port/',
+  };
+}
+
+Future<int?> _delay(String proxyName, String url) async {
+  try {
+    final delay = await coreController.testDelay(
+      TestDelayParams(proxyName: proxyName, testUrl: url, timeout: 5000),
+    );
+    return delay.value;
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<AiMeasurement> aiMeasure({
+  required String label,
+  required String url,
+  required String proxyGroup,
+}) async {
+  final results = await Future.wait([
+    _delay('DIRECT', url),
+    _delay(proxyGroup, url),
+  ]);
+  return AiMeasurement(host: label, direct: results[0], proxy: results[1]);
+}
+
+/// The proxy group a rule's PROXY target means: the one most connections went
+/// through, else the profile's first group other than GLOBAL.
+String pickProxyGroup(Map<String, int> votes, List<String> groupNames) {
+  final voted = votes.entries.toList()
+    ..sort((a, b) => b.value.compareTo(a.value));
+  if (voted.isNotEmpty) {
+    return voted.first.key;
+  }
+  return groupNames.firstWhere(
+    (name) => name != 'GLOBAL',
+    orElse: () => 'PROXY',
+  );
+}
+
+AiProposedRule? validateAiRule(
+  Map item, {
+  required String proxyGroup,
+  required Set<String> existing,
+}) {
+  final type = (item['type'] as String? ?? '').trim().toUpperCase();
+  var value = (item['value'] as String? ?? '').trim();
+  final target = switch ((item['target'] as String? ?? '')
+      .trim()
+      .toUpperCase()) {
+    'DIRECT' => 'DIRECT',
+    'PROXY' => proxyGroup,
+    _ => null,
+  };
+  final reason = (item['reason'] as String? ?? '').trim();
+  if (target == null || !aiAllowedRuleTypes.contains(type) || value.isEmpty) {
+    return null;
+  }
+  if (value.contains(',') || value.contains('\n')) {
+    return null;
+  }
+  if (type != 'PROCESS-NAME' && value.contains(' ')) {
+    return null;
+  }
+  switch (type) {
+    case 'DOMAIN' || 'DOMAIN-SUFFIX':
+      value = value.toLowerCase().replaceFirst(RegExp(r'^\*?\.'), '');
+      if (!value.contains('.') || isLocalAddress(value)) {
+        return null;
+      }
+      if (target == 'DIRECT' &&
+          _keepProxied.any((d) => value == d || value.endsWith('.$d'))) {
+        return null;
+      }
+    case 'DOMAIN-KEYWORD':
+      value = value.toLowerCase();
+      if (value.length < 4 ||
+          (target == 'DIRECT' && _keepProxied.any((d) => d.contains(value)))) {
+        return null;
+      }
+    case 'IP-CIDR':
+      if (!value.contains('/')) {
+        value = '$value/32';
+      }
+      final parts = value.split('/');
+      final prefix = int.tryParse(parts.last);
+      final ip = InternetAddress.tryParse(parts.first);
+      if (ip == null ||
+          ip.type != InternetAddressType.IPv4 ||
+          prefix == null ||
+          prefix < 8 ||
+          prefix > 32 ||
+          isLocalAddress(parts.first)) {
+        return null;
+      }
+  }
+  final rule = AiProposedRule(
+    type: type,
+    value: value,
+    target: target,
+    reason: reason.isEmpty ? 'AI 建议' : reason,
+  );
+  if (existing.contains(rule.raw.toUpperCase())) {
+    return null;
+  }
+  return rule;
+}
+
+class AiClient {
+  AiClient._();
+
+  static Future<String> _complete(
+    AiSettings settings,
+    String model,
+    String system,
+    String user,
+  ) async {
+    final dio = Dio(
+      BaseOptions(
+        connectTimeout: const Duration(seconds: 20),
+        receiveTimeout: const Duration(seconds: 180),
+        sendTimeout: const Duration(seconds: 30),
+      ),
+    );
+    final base = settings.baseUrl.endsWith('/')
+        ? settings.baseUrl.substring(0, settings.baseUrl.length - 1)
+        : settings.baseUrl;
+    final response = await dio.post<Map<String, dynamic>>(
+      '$base/chat/completions',
+      data: {
+        'model': model,
+        'response_format': {'type': 'json_object'},
+        'messages': [
+          {'role': 'system', 'content': system},
+          {'role': 'user', 'content': user},
+        ],
+      },
+      options: Options(
+        responseType: ResponseType.json,
+        headers: {'Authorization': 'Bearer ${settings.apiKey}'},
+      ),
+    );
+    final choices = response.data?['choices'];
+    if (choices is List && choices.isNotEmpty) {
+      final content = (choices.first as Map)['message']?['content'];
+      if (content is String && content.trim().isNotEmpty) {
+        return content;
+      }
+    }
+    throw const AiException('AI 没有给出回答，请再试一次。');
+  }
+
+  static bool _isModelMissing(DioException error) {
+    final status = error.response?.statusCode;
+    final body = error.response?.data.toString() ?? '';
+    return status == 404 || body.contains('model_not_found');
+  }
+
+  static AiException _explain(DioException error) {
+    final status = error.response?.statusCode;
+    return switch (status) {
+      401 => const AiException('API Key 不对或已失效，请在 AI 分流助手的设置里重新填写。'),
+      403 => const AiException('OpenAI 拒绝了请求（403），可能是地区限制。请确认代理在运行。'),
+      429 => const AiException('OpenAI 额度不足或请求太频繁（429），请检查账户余额或稍后再试。'),
+      final int code => AiException(
+        'OpenAI 返回错误 $code：${error.response?.data}',
+      ),
+      null => const AiException('连不上 OpenAI。请确认 FlClash 正在运行、代理节点可用。'),
+    };
+  }
+
+  static Future<String> ask(
+    AiSettings settings, {
+    required String system,
+    required String user,
+  }) async {
+    final models = [
+      settings.model,
+      if (settings.model == AiSettings.defaultModel)
+        ...AiSettings.fallbackModels,
+    ];
+    DioException? last;
+    for (final model in models) {
+      try {
+        return await _complete(settings, model, system, user);
+      } on DioException catch (error) {
+        last = error;
+        if (!_isModelMissing(error)) {
+          throw _explain(error);
+        }
+      }
+    }
+    throw last == null
+        ? const AiException('AI 没有给出回答，请再试一次。')
+        : AiException('找不到模型「${settings.model}」，请在设置里换一个模型名。');
+  }
+
+  static Map<String, Object?> parseJson(String content) {
+    var text = content.trim();
+    final start = text.indexOf('{');
+    final end = text.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      text = text.substring(start, end + 1);
+    }
+    try {
+      final data = jsonDecode(text);
+      if (data is Map<String, Object?>) {
+        return data;
+      }
+    } catch (_) {}
+    throw const AiException('AI 的回答格式不对，请再试一次。');
+  }
+}
+
 class AiDiagnosis {
   static const _window = Duration(minutes: 5);
   static const _maxEvidence = 40;
   static const _maxMeasured = 12;
   static const _maxRules = 10;
-  static const _allowedTypes = {
-    'DOMAIN',
-    'DOMAIN-SUFFIX',
-    'DOMAIN-KEYWORD',
-    'PROCESS-NAME',
-    'IP-CIDR',
-  };
-  static const _keepProxied = [
-    'openai.com',
-    'chatgpt.com',
-    'oaistatic.com',
-    'oaiusercontent.com',
-  ];
 
   final AiProblem problem;
   final String keyword;
@@ -360,32 +607,10 @@ class AiDiagnosis {
     if (uri == null ||
         !{'http', 'https'}.contains(uri.scheme) ||
         !uri.host.contains('.') ||
-        _isLocal(uri.host)) {
+        isLocalAddress(uri.host)) {
       return null;
     }
     return uri.replace(path: uri.path.isEmpty ? '/' : uri.path);
-  }
-
-  static bool _isLocal(String address) {
-    if (address.isEmpty || address == 'localhost') {
-      return true;
-    }
-    final ip = InternetAddress.tryParse(address);
-    if (ip == null) {
-      return false;
-    }
-    if (ip.isLoopback || ip.isLinkLocal) {
-      return true;
-    }
-    final b = ip.rawAddress;
-    if (ip.type == InternetAddressType.IPv4) {
-      return b[0] == 10 ||
-          (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
-          (b[0] == 192 && b[1] == 168) ||
-          (b[0] == 198 && (b[1] == 18 || b[1] == 19)) ||
-          (b[0] == 100 && b[1] >= 64 && b[1] <= 127);
-    }
-    return (b[0] & 0xfe) == 0xfc;
   }
 
   bool _matchesKeyword(AiEvidence item) {
@@ -415,7 +640,7 @@ class AiDiagnosis {
     for (final info in candidates) {
       final meta = info.metadata;
       final address = meta.host.isNotEmpty ? meta.host : meta.destinationIP;
-      if (_isLocal(address)) {
+      if (isLocalAddress(address)) {
         continue;
       }
       final outbound = info.chains.isEmpty ? '' : info.chains.first;
@@ -466,50 +691,11 @@ class AiDiagnosis {
       return byPriority != 0 ? byPriority : b.lastSeen.compareTo(a.lastSeen);
     });
     _evidence = items.take(_maxEvidence).toList();
-    final voted = groupVotes.entries.toList()
-      ..sort((a, b) => b.value.compareTo(a.value));
-    _proxyGroup = voted.isNotEmpty
-        ? voted.first.key
-        : groupNames.firstWhere(
-            (name) => name != 'GLOBAL',
-            orElse: () => 'PROXY',
-          );
+    _proxyGroup = pickProxyGroup(groupVotes, groupNames);
     return _evidence.length;
   }
 
   String get proxyGroup => _proxyGroup;
-
-  // A bare IP has no certificate to match, so its TLS port is asked in plain
-  // HTTP: the error page a TLS server sends back still times the round trip.
-  static String _testUrl(AiEvidence item) {
-    final address = item.host.isNotEmpty ? item.host : item.ip;
-    final isIp = InternetAddress.tryParse(address) != null;
-    return switch (item.port) {
-      '80' => 'http://$address/',
-      '' || '443' when isIp => 'http://$address:443/',
-      '' || '443' => 'https://$address/',
-      _ => '${isIp ? 'http' : 'https'}://$address:${item.port}/',
-    };
-  }
-
-  Future<int?> _delay(String proxyName, String url) async {
-    try {
-      final delay = await coreController.testDelay(
-        TestDelayParams(proxyName: proxyName, testUrl: url, timeout: 5000),
-      );
-      return delay.value;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  Future<AiMeasurement> _measure(String label, String url) async {
-    final results = await Future.wait([
-      _delay('DIRECT', url),
-      _delay(_proxyGroup, url),
-    ]);
-    return AiMeasurement(host: label, direct: results[0], proxy: results[1]);
-  }
 
   Future<List<AiMeasurement>> measure() {
     final target = this.target;
@@ -518,8 +704,18 @@ class AiDiagnosis {
         .where((item) => item.key.isNotEmpty && item.key != targetHost)
         .take(target == null ? _maxMeasured : _maxMeasured - 1);
     return Future.wait([
-      if (target != null) _measure(target.authority, target.toString()),
-      for (final item in evidence) _measure(item.key, _testUrl(item)),
+      if (target != null)
+        aiMeasure(
+          label: target.authority,
+          url: target.toString(),
+          proxyGroup: _proxyGroup,
+        ),
+      for (final item in evidence)
+        aiMeasure(
+          label: item.key,
+          url: aiTestUrl(item.key, item.port),
+          proxyGroup: _proxyGroup,
+        ),
     ]);
   }
 
@@ -546,164 +742,6 @@ Guidelines:
 Reply with one JSON object only:
 {"summary": "2-3 句简体中文：发现了什么，建议怎么改", "rules": [{"type": "DOMAIN-SUFFIX", "value": "example.com", "target": "DIRECT", "reason": "一句简体中文"}]}''';
 
-  Future<String> _complete(String model, String userContent) async {
-    final dio = Dio(
-      BaseOptions(
-        connectTimeout: const Duration(seconds: 20),
-        receiveTimeout: const Duration(seconds: 120),
-        sendTimeout: const Duration(seconds: 30),
-      ),
-    );
-    final base = settings.baseUrl.endsWith('/')
-        ? settings.baseUrl.substring(0, settings.baseUrl.length - 1)
-        : settings.baseUrl;
-    final response = await dio.post<Map<String, dynamic>>(
-      '$base/chat/completions',
-      data: {
-        'model': model,
-        'response_format': {'type': 'json_object'},
-        'messages': [
-          {'role': 'system', 'content': _systemPrompt},
-          {'role': 'user', 'content': userContent},
-        ],
-      },
-      options: Options(
-        responseType: ResponseType.json,
-        headers: {'Authorization': 'Bearer ${settings.apiKey}'},
-      ),
-    );
-    final choices = response.data?['choices'];
-    if (choices is List && choices.isNotEmpty) {
-      final content = (choices.first as Map)['message']?['content'];
-      if (content is String && content.trim().isNotEmpty) {
-        return content;
-      }
-    }
-    throw const AiException('AI 没有给出回答，请再试一次。');
-  }
-
-  static bool _isModelMissing(DioException error) {
-    final status = error.response?.statusCode;
-    final body = error.response?.data.toString() ?? '';
-    return status == 404 || body.contains('model_not_found');
-  }
-
-  static AiException _explain(DioException error) {
-    final status = error.response?.statusCode;
-    return switch (status) {
-      401 => const AiException('API Key 不对或已失效，请在下方设置里重新填写。'),
-      403 => const AiException('OpenAI 拒绝了请求（403），可能是地区限制。请确认代理在运行。'),
-      429 => const AiException('OpenAI 额度不足或请求太频繁（429），请检查账户余额或稍后再试。'),
-      final int code => AiException(
-        'OpenAI 返回错误 $code：${error.response?.data}',
-      ),
-      null => const AiException('连不上 OpenAI。请确认 FlClash 正在运行、代理节点可用。'),
-    };
-  }
-
-  Future<String> _ask(String userContent) async {
-    final models = [
-      settings.model,
-      if (settings.model == AiSettings.defaultModel)
-        ...AiSettings.fallbackModels,
-    ];
-    DioException? last;
-    for (final model in models) {
-      try {
-        return await _complete(model, userContent);
-      } on DioException catch (error) {
-        last = error;
-        if (!_isModelMissing(error)) {
-          throw _explain(error);
-        }
-      }
-    }
-    throw last == null
-        ? const AiException('AI 没有给出回答，请再试一次。')
-        : AiException('找不到模型「${settings.model}」，请在设置里换一个模型名。');
-  }
-
-  static Map<String, Object?> _parseJson(String content) {
-    var text = content.trim();
-    final start = text.indexOf('{');
-    final end = text.lastIndexOf('}');
-    if (start >= 0 && end > start) {
-      text = text.substring(start, end + 1);
-    }
-    try {
-      final data = jsonDecode(text);
-      if (data is Map<String, Object?>) {
-        return data;
-      }
-    } catch (_) {}
-    throw const AiException('AI 的回答格式不对，请再试一次。');
-  }
-
-  AiProposedRule? _validate(Map item, Set<String> existing) {
-    final type = (item['type'] as String? ?? '').trim().toUpperCase();
-    var value = (item['value'] as String? ?? '').trim();
-    final target = switch ((item['target'] as String? ?? '')
-        .trim()
-        .toUpperCase()) {
-      'DIRECT' => 'DIRECT',
-      'PROXY' => _proxyGroup,
-      _ => null,
-    };
-    final reason = (item['reason'] as String? ?? '').trim();
-    if (target == null || !_allowedTypes.contains(type) || value.isEmpty) {
-      return null;
-    }
-    if (value.contains(',') || value.contains('\n')) {
-      return null;
-    }
-    if (type != 'PROCESS-NAME' && value.contains(' ')) {
-      return null;
-    }
-    switch (type) {
-      case 'DOMAIN' || 'DOMAIN-SUFFIX':
-        value = value.toLowerCase().replaceFirst(RegExp(r'^\*?\.'), '');
-        if (!value.contains('.') || _isLocal(value)) {
-          return null;
-        }
-        if (target == 'DIRECT' &&
-            _keepProxied.any((d) => value == d || value.endsWith('.$d'))) {
-          return null;
-        }
-      case 'DOMAIN-KEYWORD':
-        value = value.toLowerCase();
-        if (value.length < 4 ||
-            (target == 'DIRECT' &&
-                _keepProxied.any((d) => d.contains(value)))) {
-          return null;
-        }
-      case 'IP-CIDR':
-        if (!value.contains('/')) {
-          value = '$value/32';
-        }
-        final parts = value.split('/');
-        final prefix = int.tryParse(parts.last);
-        final ip = InternetAddress.tryParse(parts.first);
-        if (ip == null ||
-            ip.type != InternetAddressType.IPv4 ||
-            prefix == null ||
-            prefix < 8 ||
-            prefix > 32 ||
-            _isLocal(parts.first)) {
-          return null;
-        }
-    }
-    final rule = AiProposedRule(
-      type: type,
-      value: value,
-      target: target,
-      reason: reason.isEmpty ? 'AI 建议' : reason,
-    );
-    if (existing.contains(rule.raw.toUpperCase())) {
-      return null;
-    }
-    return rule;
-  }
-
   Future<AiProposal> propose({
     required List<AiMeasurement> measurements,
     required String mode,
@@ -720,7 +758,7 @@ Reply with one JSON object only:
       'reachability': [for (final item in measurements) item.toJson()],
     });
     return parseAnswer(
-      await _ask(userContent),
+      await AiClient.ask(settings, system: _systemPrompt, user: userContent),
       measurements: measurements,
       existingRules: existingRules,
     );
@@ -731,13 +769,17 @@ Reply with one JSON object only:
     required List<AiMeasurement> measurements,
     required Set<String> existingRules,
   }) {
-    final data = _parseJson(content);
+    final data = AiClient.parseJson(content);
     final existing = {for (final raw in existingRules) raw.toUpperCase()};
     final rules = <AiProposedRule>[];
     final list = data['rules'];
     if (list is List) {
       for (final item in list.whereType<Map>()) {
-        final rule = _validate(item, existing);
+        final rule = validateAiRule(
+          item,
+          proxyGroup: _proxyGroup,
+          existing: existing,
+        );
         if (rule != null && existing.add(rule.raw.toUpperCase())) {
           rules.add(rule);
         }
