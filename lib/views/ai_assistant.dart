@@ -90,6 +90,17 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
     if (!_settings.ready && !await _editKey()) {
       return;
     }
+    if (ref.read(patchClashConfigProvider).mode != Mode.rule) {
+      final switchMode = await dialogs.showMessage(
+        title: '先切换到「规则」模式？',
+        message: const TextSpan(text: '现在不是「规则」模式，分流规则不会生效，AI 的建议也用不上。'),
+        confirmText: '切换',
+      );
+      if (switchMode != true) {
+        return;
+      }
+      ref.read(setupActionProvider.notifier).changeMode(Mode.rule);
+    }
     final keyword = await dialogs.showCommonDialog<String>(
       child: const InputDialog(
         title: '是哪个网站或软件？',
@@ -177,6 +188,7 @@ class _AiAssistantViewState extends ConsumerState<AiAssistantView> {
       ..._records,
     ];
     await _store.saveRecords(_records);
+    await Future<void>.delayed(const Duration(seconds: 2));
     for (final info in live) {
       if (selected.any((rule) => rule.matches(info))) {
         unawaited(coreController.closeConnection(info.id));
