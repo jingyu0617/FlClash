@@ -320,6 +320,216 @@ const aiAllowedRuleTypes = {
   'IP-CIDR',
 };
 
+/// Sites whose route is common knowledge: the code settles them without
+/// asking the model or the user.
+enum AiPreset {
+  foreignAi('国外 AI', 'PROXY', [
+    'openai.com',
+    'chatgpt.com',
+    'oaistatic.com',
+    'oaiusercontent.com',
+    'anthropic.com',
+    'claude.ai',
+    'claude.com',
+    'claudeusercontent.com',
+    'gemini.google.com',
+    'aistudio.google.com',
+    'generativelanguage.googleapis.com',
+    'notebooklm.google.com',
+    'perplexity.ai',
+    'pplx.ai',
+    'x.ai',
+    'grok.com',
+    'midjourney.com',
+    'poe.com',
+    'character.ai',
+    'mistral.ai',
+    'cohere.com',
+    'huggingface.co',
+    'hf.co',
+    'openrouter.ai',
+    'groq.com',
+    'together.ai',
+    'replicate.com',
+    'cursor.com',
+    'cursor.sh',
+    'githubcopilot.com',
+    'copilot.microsoft.com',
+    'elevenlabs.io',
+    'runwayml.com',
+    'suno.com',
+    'ideogram.ai',
+    'leonardo.ai',
+    'lovable.dev',
+    'v0.dev',
+    'bolt.new',
+  ]),
+  business('跨境业务平台', 'PROXY', [
+    'shopify.com',
+    'myshopify.com',
+    'shopifycdn.com',
+    'shopifysvc.com',
+    'shopifycloud.com',
+    'shop.app',
+    'shopline.com',
+    'myshopline.com',
+    'shoplineapp.com',
+    'paypal.com',
+    'paypalobjects.com',
+    'braintreegateway.com',
+    'stripe.com',
+    'stripe.network',
+    'stripecdn.com',
+    'amazon.com',
+    'sellercentral.amazon.com',
+    'ebay.com',
+    'etsy.com',
+    'walmart.com',
+    'klaviyo.com',
+    'judge.me',
+    'ads.microsoft.com',
+    'business.tiktok.com',
+  ]),
+  blocked('国内上不了的国外服务', 'PROXY', [
+    'google.com',
+    'googleapis.com',
+    'gstatic.com',
+    'googleusercontent.com',
+    'ggpht.com',
+    'youtube.com',
+    'youtu.be',
+    'ytimg.com',
+    'googlevideo.com',
+    'facebook.com',
+    'facebook.net',
+    'fbcdn.net',
+    'messenger.com',
+    'instagram.com',
+    'cdninstagram.com',
+    'whatsapp.com',
+    'whatsapp.net',
+    'twitter.com',
+    'x.com',
+    'twimg.com',
+    't.co',
+    'telegram.org',
+    't.me',
+    'telegram.me',
+    'discord.com',
+    'discord.gg',
+    'discordapp.com',
+    'discordapp.net',
+    'reddit.com',
+    'redd.it',
+    'redditmedia.com',
+    'redditstatic.com',
+    'wikipedia.org',
+    'wikimedia.org',
+    'medium.com',
+    'quora.com',
+    'pinterest.com',
+    'tiktok.com',
+    'tiktokcdn.com',
+    'line.me',
+    'signal.org',
+    'dropbox.com',
+    'github.com',
+    'githubusercontent.com',
+    'githubassets.com',
+    'vimeo.com',
+    'twitch.tv',
+    'spotify.com',
+    'nytimes.com',
+    'bbc.com',
+    'bbc.co.uk',
+    'bloomberg.com',
+    'reuters.com',
+    'wsj.com',
+  ]),
+  china('国内大厂', 'DIRECT', [
+    'qq.com',
+    'wechat.com',
+    'tencent.com',
+    'gtimg.cn',
+    'qpic.cn',
+    'qlogo.cn',
+    'myqcloud.com',
+    'tencent-cloud.com',
+    'taobao.com',
+    'tmall.com',
+    'alipay.com',
+    'alicdn.com',
+    'aliyun.com',
+    'aliyuncs.com',
+    '1688.com',
+    'alimama.com',
+    'baidu.com',
+    'bdstatic.com',
+    'bdimg.com',
+    'baidupcs.com',
+    'bytedance.com',
+    'douyin.com',
+    'douyinpic.com',
+    'toutiao.com',
+    'snssdk.com',
+    'feishu.cn',
+    'jd.com',
+    '360buyimg.com',
+    'meituan.com',
+    'meituan.net',
+    'dianping.com',
+    '163.com',
+    '126.net',
+    '127.net',
+    'netease.com',
+    'xiaohongshu.com',
+    'xhscdn.com',
+    'bilibili.com',
+    'hdslb.com',
+    'biliapi.net',
+    'bilivideo.com',
+    'weibo.com',
+    'sina.com.cn',
+    'sinaimg.cn',
+    'zhihu.com',
+    'zhimg.com',
+    'pinduoduo.com',
+    'yangkeduo.com',
+    'kuaishou.com',
+    'ctrip.com',
+    'iqiyi.com',
+    'youku.com',
+    'dingtalk.com',
+    'csdn.net',
+    'douban.com',
+    'mi.com',
+    'xiaomi.com',
+    'huawei.com',
+    'hicloud.com',
+    '12306.cn',
+    '360.cn',
+  ]);
+
+  final String label;
+  final String verdict;
+  final List<String> domains;
+
+  const AiPreset(this.label, this.verdict, this.domains);
+}
+
+/// The preset and the listed domain [host] falls under, if any.
+({AiPreset preset, String domain})? aiPresetOf(String host) {
+  final value = host.toLowerCase();
+  for (final preset in AiPreset.values) {
+    for (final domain in preset.domains) {
+      if (value == domain || value.endsWith('.$domain')) {
+        return (preset: preset, domain: domain);
+      }
+    }
+  }
+  return null;
+}
+
 const _keepProxied = [
   'openai.com',
   'chatgpt.com',
@@ -383,7 +593,9 @@ const _neverBlock = [
 /// an account needs to work.
 bool aiCanBlock(String domain) {
   final value = domain.toLowerCase();
-  if (InternetAddress.tryParse(value) != null || !value.contains('.')) {
+  if (InternetAddress.tryParse(value) != null ||
+      !value.contains('.') ||
+      aiPresetOf(value) != null) {
     return false;
   }
   return !_neverBlock.any((d) => value == d || value.endsWith('.$d'));
@@ -499,6 +711,15 @@ AiProposedRule? validateAiRule(
       }
       if (target == 'DIRECT' &&
           _keepProxied.any((d) => value == d || value.endsWith('.$d'))) {
+        return null;
+      }
+      final preset = aiPresetOf(value)?.preset;
+      final verdict = switch (target) {
+        'DIRECT' => 'DIRECT',
+        'REJECT' => 'BLOCK',
+        _ => 'PROXY',
+      };
+      if (preset != null && preset.verdict != verdict) {
         return null;
       }
     case 'DOMAIN-KEYWORD':
@@ -842,7 +1063,7 @@ Guidelines:
 - A Chinese app or site that does not work (WeChat/微信, QQ, WeCom/企业微信, DingTalk/钉钉, Feishu/飞书, Alipay, Taobao, Baidu and the like) must go DIRECT, never through the proxy: Chinese services often refuse or throttle foreign proxy IPs, and these apps connect to many bare IPs that domain rules miss. Propose PROCESS-NAME for the whole app, using the process name exactly as it appears in the connections (WeChat on macOS is "WeChat"), plus DOMAIN-SUFFIX for its main domains (weixin.qq.com, wechat.com, qq.com, qpic.cn, ...) when they are not already DIRECT.
 - Problem "太慢": a host whose DIRECT test succeeds and is clearly faster than the proxy should go DIRECT. That covers Chinese services and also servers in Hong Kong, Macau, Taiwan or nearby Asia that are not blocked in China (for example Alibaba Cloud or Tencent Cloud servers abroad): sending them through a far-away proxy only adds distance. A Chinese service (Chinese company, Chinese CDN, .cn domain, ipCountry CN) going through the proxy should go DIRECT even without a test. If DIRECT fails or times out, keep it on the proxy.
 - Prefer DOMAIN-SUFFIX on the registrable domain (taobao.com, alicdn.com) so related subdomains are covered. Use PROCESS-NAME only when a whole app should take one route and its process name appears in the data. Use DOMAIN-KEYWORD rarely. Use IP-CIDR (the single address as /32) only for hosts without a domain.
-- Never route openai.com, chatgpt.com, oaistatic.com or oaiusercontent.com DIRECT. Never add rules for private or LAN addresses.
+- Foreign AI services (ChatGPT/OpenAI, Claude, Gemini, Perplexity, Grok and the like), cross-border business platforms (Shopify, PayPal, Stripe, Amazon and other seller back offices, ad platforms) and services blocked in China always go PROXY: never route them DIRECT and never ask about them. Never add rules for private or LAN addresses.
 - If the proxy test fails for nearly every host, the proxy server itself is down: return no rules and say so.
 - Skip hosts that are already routed correctly.
 - At most $_maxRules rules. target is "DIRECT" or "PROXY".

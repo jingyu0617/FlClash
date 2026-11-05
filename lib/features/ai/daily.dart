@@ -136,7 +136,7 @@ class AiTrafficLog with CoreEventListener {
 
   static final instance = AiTrafficLog._();
 
-  static const _keepDays = 30;
+  static const keepDays = 30;
   static const _maxHosts = 30000;
   static const _maxLive = 20000;
   static const _noReplyAfter = Duration(minutes: 2);
@@ -310,7 +310,7 @@ class AiTrafficLog with CoreEventListener {
   Future<void> _purge() async {
     try {
       final cutoff = _dayOf(
-        DateTime.now().subtract(const Duration(days: _keepDays)),
+        DateTime.now().subtract(const Duration(days: keepDays)),
       );
       await for (final entity in (await _aiDir('logs')).list()) {
         final name = entity.uri.pathSegments.last.replaceAll('.json', '');
@@ -327,6 +327,7 @@ const aiCategoryLabels = {
   'ads': '广告和统计（网页后台自动加载的）',
   'infra': '公共资源和服务（字体、加速、云服务）',
   'ip': '看不出来源的 IP 地址',
+  'preset': '常识名单（固定处理，不问 AI）',
 };
 
 String aiCategoryLabel(String category) => aiCategoryLabels[category] ?? '其他';
@@ -376,13 +377,12 @@ class AiKnownSite {
   };
 }
 
-enum AiPendingChoice { later, accept, decline, block }
-
 class AiPendingRule {
   final AiProposedRule rule;
   final String site;
   final String category;
   final String about;
+  final String current;
   final int? direct;
   final int? proxy;
   final DateTime at;
@@ -392,16 +392,19 @@ class AiPendingRule {
     required this.site,
     this.category = '',
     this.about = '',
+    this.current = '',
     this.direct,
     this.proxy,
     required this.at,
   });
 
-  String get suggestion => rule.target == 'DIRECT'
-      ? '直连'
+  String get verdict => rule.target == 'DIRECT'
+      ? 'DIRECT'
       : rule.target == 'REJECT'
-      ? '屏蔽'
-      : '走代理';
+      ? 'BLOCK'
+      : 'PROXY';
+
+  String get suggestion => aiVerdictLabel(verdict);
 
   factory AiPendingRule.fromJson(Map<String, Object?> json) => AiPendingRule(
     rule: AiProposedRule(
@@ -413,6 +416,7 @@ class AiPendingRule {
     site: json['site'] as String? ?? '',
     category: json['category'] as String? ?? '',
     about: json['about'] as String? ?? '',
+    current: json['current'] as String? ?? '',
     direct: (json['direct'] as num?)?.toInt(),
     proxy: (json['proxy'] as num?)?.toInt(),
     at: DateTime.tryParse(json['at'] as String? ?? '') ?? DateTime.now(),
@@ -426,6 +430,7 @@ class AiPendingRule {
     'site': site,
     'category': category,
     'about': about,
+    'current': current,
     'direct': direct,
     'proxy': proxy,
     'at': at.toIso8601String(),
@@ -438,6 +443,7 @@ class AiReport {
   final int unknown;
   final int measured;
   final List<String> applied;
+  final int replaced;
   final int pending;
   final String summary;
   final String? error;
@@ -448,6 +454,7 @@ class AiReport {
     this.unknown = 0,
     this.measured = 0,
     this.applied = const [],
+    this.replaced = 0,
     this.pending = 0,
     this.summary = '',
     this.error,
@@ -457,12 +464,13 @@ class AiReport {
     if (error != null) {
       return '没有完成：$error';
     }
-    if (unknown == 0) {
+    if (unknown == 0 && applied.isEmpty) {
       return '没有新的未识别地址，一切正常。';
     }
     final blocked = applied.where((raw) => raw.endsWith(',REJECT')).length;
     final routed = applied.length - blocked;
-    return '检查了 $unknown 个新地址：自动调整 $routed 个、屏蔽广告统计 $blocked 个，'
+    final swapped = replaced > 0 ? '（替换了 $replaced 条旧规则）' : '';
+    return '检查了 $unknown 个地址：自动调整 $routed 个、屏蔽广告统计 $blocked 个$swapped，'
         '$pending 条等你确认。';
   }
 
@@ -475,6 +483,7 @@ class AiReport {
       for (final item in (json['applied'] as List?) ?? const [])
         if (item is String) item,
     ],
+    replaced: (json['replaced'] as num?)?.toInt() ?? 0,
     pending: (json['pending'] as num?)?.toInt() ?? 0,
     summary: json['summary'] as String? ?? '',
     error: json['error'] as String?,
@@ -486,6 +495,7 @@ class AiReport {
     'unknown': unknown,
     'measured': measured,
     'applied': applied,
+    'replaced': replaced,
     'pending': pending,
     'summary': summary,
     'error': ?error,
@@ -509,6 +519,12 @@ class _Site {
       (hostCounts.entries.toList()..sort((a, b) => b.value.compareTo(a.value)))
           .first
           .key;
+
+  String get current => outbound == 'DIRECT'
+      ? 'DIRECT'
+      : outbound.startsWith('REJECT')
+      ? 'BLOCK'
+      : 'PROXY';
 
   String get outbound =>
       (outbounds.entries.toList()..sort((a, b) => b.value.compareTo(a.value)))
@@ -545,6 +561,7 @@ class AiDaily {
   static const _retryAfter = Duration(hours: 1);
   static const _offlineRetry = Duration(minutes: 20);
   static const _maxSites = 120;
+  static const _maxRematchSites = 300;
   static const _sitesPerCall = 60;
   static const _maxPending = 60;
   static const _maxReports = 14;
@@ -707,21 +724,38 @@ class AiDaily {
     await run(ref);
   }
 
-  Future<AiReport?> run(WidgetRef ref, {bool manual = false}) async {
+  Future<AiReport?> run(
+    WidgetRef ref, {
+    bool manual = false,
+    bool rematch = false,
+  }) async {
     if (running) {
       return null;
     }
     running = true;
     changes.value++;
     try {
-      return await _run(ref, manual: manual);
+      return await _run(ref, manual: manual || rematch, rematch: rematch);
     } finally {
       running = false;
       changes.value++;
     }
   }
 
-  Future<AiReport?> _run(WidgetRef ref, {required bool manual}) async {
+  static bool _isUserRecord(AiRuleRecord record) =>
+      record.reason.startsWith('［你确认的］') || record.reason.startsWith('［你改的］');
+
+  static String _observed(AiHostLog log) => log.outbound.startsWith('REJECT')
+      ? 'BLOCK'
+      : log.isDirect
+      ? 'DIRECT'
+      : 'PROXY';
+
+  Future<AiReport?> _run(
+    WidgetRef ref, {
+    required bool manual,
+    required bool rematch,
+  }) async {
     final now = DateTime.now();
     final state = await readState();
     final settings = await AiStore.instance.loadSettings();
@@ -731,9 +765,10 @@ class AiDaily {
     final lastRun =
         DateTime.tryParse(state['lastRun'] as String? ?? '') ??
         now.subtract(const Duration(days: 1));
-    final from = lastRun.isBefore(now.subtract(const Duration(days: 3)))
-        ? now.subtract(const Duration(days: 3))
-        : lastRun;
+    final oldest = now.subtract(
+      Duration(days: rematch ? AiTrafficLog.keepDays : 3),
+    );
+    final from = rematch || lastRun.isBefore(oldest) ? oldest : lastRun;
     await AiTrafficLog.instance.flush();
     final hosts = <String, AiHostLog>{};
     for (
@@ -770,28 +805,137 @@ class AiDaily {
       if (item == null) {
         return false;
       }
-      return item.source == 'user' || now.difference(item.at) < _knownFor;
+      if (item.byUser) {
+        return true;
+      }
+      return !rematch && now.difference(item.at) < _knownFor;
+    }
+
+    final records = await AiStore.instance.loadRecords();
+    final aiRecords = <String, List<AiRuleRecord>>{};
+    final userValues = <String>{};
+    for (final record in records) {
+      final value = ruleValueOf(record.raw).replaceAll('/32', '');
+      if (_isUserRecord(record)) {
+        userValues.add(value);
+      } else {
+        aiRecords.putIfAbsent(value, () => []).add(record);
+      }
+    }
+
+    final presets = <String, AiPreset>{};
+    void checkPreset(String host, String observed) {
+      final match = aiPresetOf(host);
+      if (match == null ||
+          observed == match.preset.verdict ||
+          known[match.domain]?.byUser == true ||
+          userValues.contains(match.domain)) {
+        return;
+      }
+      presets[match.domain] = match.preset;
+    }
+
+    for (final MapEntry(key: value, value: list) in aiRecords.entries) {
+      for (final record in list) {
+        final target = ruleTargetOf(record.raw);
+        checkPreset(
+          value,
+          target == 'DIRECT'
+              ? 'DIRECT'
+              : target == 'REJECT'
+              ? 'BLOCK'
+              : 'PROXY',
+        );
+      }
     }
 
     final sites = <String, _Site>{};
     for (final log in hosts.values) {
-      final directFailing =
-          log.isDirect && log.count >= 3 && log.noReply * 2 >= log.count;
-      if (!log.isFallback && !directFailing) {
+      final site = siteOf(log.host);
+      if (isLocalAddress(site)) {
         continue;
       }
-      final site = siteOf(log.host);
-      if (isLocalAddress(site) || isKnown(site)) {
+      if (aiPresetOf(log.host) != null) {
+        checkPreset(log.host, _observed(log));
+        continue;
+      }
+      final comma = log.rule.indexOf(',');
+      final payload = comma < 0
+          ? ''
+          : log.rule.substring(comma + 1).toLowerCase().replaceAll('/32', '');
+      final ruledByAi = rematch && aiRecords.containsKey(payload);
+      final directFailing =
+          log.isDirect && log.count >= 3 && log.noReply * 2 >= log.count;
+      if (!log.isFallback && !directFailing && !ruledByAi) {
+        continue;
+      }
+      if (isKnown(site) || userValues.contains(site)) {
         continue;
       }
       sites.putIfAbsent(site, () => _Site(site)).add(log);
     }
     final ranked = sites.values.toList()
       ..sort((a, b) => b.count.compareTo(a.count));
-    final chosen = ranked.take(_maxSites).toList();
+    final chosen = ranked.take(rematch ? _maxRematchSites : _maxSites).toList();
 
+    final existing = {
+      for (final rule in ref.read(globalRulesProvider).value ?? <Rule>[])
+        rule.rawValue.toUpperCase(),
+    };
+    final toApply = <AiProposedRule>[];
+    final replaceValues = <String>{};
+    void place(AiProposedRule rule, String value) {
+      final raw = rule.raw.toUpperCase();
+      final conflicting = (aiRecords[value] ?? const <AiRuleRecord>[]).any(
+        (record) => record.raw.toUpperCase() != raw,
+      );
+      if (conflicting) {
+        replaceValues.add(value);
+      } else if (existing.contains(raw)) {
+        return;
+      }
+      existing.add(raw);
+      toApply.add(rule);
+    }
+
+    for (final MapEntry(key: domain, value: preset) in presets.entries) {
+      place(
+        AiProposedRule(
+          type: 'DOMAIN-SUFFIX',
+          value: domain,
+          target: preset.verdict == 'DIRECT' ? 'DIRECT' : proxyGroup,
+          reason: '常识名单：${preset.label}',
+        ),
+        domain,
+      );
+      known[domain] = AiKnownSite(
+        verdict: preset.verdict,
+        source: 'preset',
+        reason: '常识名单：${preset.label}',
+        category: 'preset',
+        about: preset.label,
+        at: now,
+      );
+    }
+
+    final measurements = <String, AiMeasurement>{};
+    final summaries = <String>[];
+    final pending = rematch ? <AiPendingRule>[] : await readPending();
+    final pendingRaw = {
+      for (final item in pending) item.rule.raw.toUpperCase(),
+    };
     if (chosen.isEmpty) {
-      return _finish(state, AiReport(at: now, hosts: hosts.length));
+      return _complete(
+        ref,
+        state,
+        known: known,
+        proxyGroup: proxyGroup,
+        toApply: toApply,
+        replaceValues: replaceValues,
+        pending: pending,
+        rematch: rematch,
+        report: AiReport(at: now, hosts: hosts.length),
+      );
     }
 
     final probe = await aiMeasure(
@@ -815,7 +959,6 @@ class AiDaily {
       return null;
     }
 
-    final measurements = <String, AiMeasurement>{};
     for (var index = 0; index < chosen.length; index += 15) {
       final batch = chosen.skip(index).take(15);
       final results = await Future.wait([
@@ -830,17 +973,6 @@ class AiDaily {
         measurements[item.host] = item;
       }
     }
-
-    final existing = {
-      for (final rule in ref.read(globalRulesProvider).value ?? <Rule>[])
-        rule.rawValue.toUpperCase(),
-    };
-    final summaries = <String>[];
-    final toApply = <AiProposedRule>[];
-    final pending = await readPending();
-    final pendingRaw = {
-      for (final item in pending) item.rule.raw.toUpperCase(),
-    };
 
     for (var index = 0; index < chosen.length; index += _sitesPerCall) {
       final batch = chosen.skip(index).take(_sitesPerCall).toList();
@@ -912,7 +1044,6 @@ class AiDaily {
         if (rule == null || pendingRaw.contains(rule.raw.toUpperCase())) {
           continue;
         }
-        existing.add(rule.raw.toUpperCase());
         final measured = measurements[site.key];
         final auto = shouldAutoApply(
           verdict: verdict,
@@ -923,7 +1054,7 @@ class AiDaily {
           proxyMs: measured?.proxy,
         );
         if (auto) {
-          toApply.add(rule);
+          place(rule, rule.value);
         } else {
           pendingRaw.add(rule.raw.toUpperCase());
           pending.add(
@@ -932,6 +1063,7 @@ class AiDaily {
               site: site.key,
               category: category,
               about: about,
+              current: site.current,
               direct: measured?.direct,
               proxy: measured?.proxy,
               at: now,
@@ -941,10 +1073,43 @@ class AiDaily {
       }
     }
 
+    return _complete(
+      ref,
+      state,
+      known: known,
+      proxyGroup: proxyGroup,
+      toApply: toApply,
+      replaceValues: replaceValues,
+      pending: pending,
+      rematch: rematch,
+      report: AiReport(
+        at: now,
+        hosts: hosts.length,
+        unknown: chosen.length + presets.length,
+        measured: measurements.length,
+        summary: summaries.join('\n'),
+      ),
+    );
+  }
+
+  Future<AiReport> _complete(
+    WidgetRef ref,
+    Map<String, Object?> state, {
+    required Map<String, AiKnownSite> known,
+    required String proxyGroup,
+    required List<AiProposedRule> toApply,
+    required Set<String> replaceValues,
+    required List<AiPendingRule> pending,
+    required bool rematch,
+    required AiReport report,
+  }) async {
     await _writeKnown(known);
     state['proxyGroup'] = proxyGroup;
+    final replaced = replaceValues.isEmpty
+        ? 0
+        : await _removeRulesFor(ref, replaceValues, keepUser: true);
     if (toApply.isNotEmpty) {
-      await applyRules(ref, toApply, tag: '每日体检');
+      await applyRules(ref, toApply, tag: rematch ? '重新判断' : '每日体检');
     }
     final kept = pending.length > _maxPending
         ? pending.sublist(pending.length - _maxPending)
@@ -953,13 +1118,14 @@ class AiDaily {
     return _finish(
       state,
       AiReport(
-        at: now,
-        hosts: hosts.length,
-        unknown: chosen.length,
-        measured: measurements.length,
+        at: report.at,
+        hosts: report.hosts,
+        unknown: report.unknown == 0 ? toApply.length : report.unknown,
+        measured: report.measured,
         applied: [for (final rule in toApply) rule.raw],
+        replaced: replaced,
         pending: kept.length,
-        summary: summaries.join('\n'),
+        summary: report.summary,
       ),
     );
   }
@@ -1068,67 +1234,82 @@ class AiDaily {
     );
   }
 
-  /// Takes off every rule the assistant added for [site].
-  Future<void> _removeRulesFor(WidgetRef ref, Set<String> sites) async {
+  /// Takes off the rules the assistant added for [sites]; with [keepUser],
+  /// not the ones the user chose.
+  Future<int> _removeRulesFor(
+    WidgetRef ref,
+    Set<String> sites, {
+    bool keepUser = false,
+  }) async {
     final store = AiStore.instance;
     final records = await store.loadRecords();
     final removed = {
       for (final record in records)
-        if (sites.contains(ruleValueOf(record.raw).replaceAll('/32', '')))
+        if (sites.contains(ruleValueOf(record.raw).replaceAll('/32', '')) &&
+            !(keepUser && _isUserRecord(record)))
           record.ruleId,
     };
     if (removed.isEmpty) {
-      return;
+      return 0;
     }
     ref.read(globalRulesProvider.notifier).delAll(removed);
     await store.saveRecords([
       for (final record in records)
         if (!removed.contains(record.ruleId)) record,
     ]);
+    return removed.length;
   }
 
-  Future<void> resolvePending(
+  /// Settles [items] the user picked: [action] is AI for each one's own
+  /// suggestion, or DIRECT, PROXY, BLOCK or KEEP for all of them. Returns
+  /// how many could not take it (blocking a site pages need).
+  Future<int> decidePending(
     WidgetRef ref,
-    Map<AiPendingRule, AiPendingChoice> choices,
+    List<AiPendingRule> items,
+    String action,
   ) async {
     final known = await readKnown();
     final now = DateTime.now();
+    final proxyGroup = await proxyGroupFor(ref);
     final toApply = <AiProposedRule>[];
     final done = <String>{};
-    for (final MapEntry(key: item, value: choice) in choices.entries) {
-      if (choice == AiPendingChoice.later) {
-        continue;
+    final sites = <String>{};
+    var skipped = 0;
+    for (final item in items) {
+      final verdict = action == 'AI' ? item.verdict : action;
+      AiProposedRule? rule;
+      if (verdict != 'KEEP') {
+        rule = action == 'AI'
+            ? item.rule
+            : _ruleFor(
+                item.site,
+                verdict,
+                proxyGroup,
+                '你选择${aiVerdictLabel(verdict)}',
+              );
+        if (rule == null) {
+          skipped++;
+          continue;
+        }
+        toApply.add(rule);
+        sites.add(item.site);
       }
       done.add(item.rule.raw);
-      final rule = switch (choice) {
-        AiPendingChoice.accept => item.rule,
-        AiPendingChoice.block => _ruleFor(item.site, 'BLOCK', '', '你选择屏蔽'),
-        _ => null,
-      };
-      if (rule != null) {
-        toApply.add(rule);
-      }
       known[item.site] = AiKnownSite(
-        verdict: switch (choice) {
-          AiPendingChoice.accept =>
-            item.rule.target == 'DIRECT'
-                ? 'DIRECT'
-                : item.rule.target == 'REJECT'
-                ? 'BLOCK'
-                : 'PROXY',
-          AiPendingChoice.block => 'BLOCK',
-          _ => 'KEEP',
-        },
+        verdict: verdict,
         source: 'user',
-        reason: choice == AiPendingChoice.decline
-            ? '你没有采纳 AI 的建议（${item.suggestion}）'
-            : '你确认的',
+        reason: action == 'AI'
+            ? '你采纳了 AI 的建议'
+            : '你选择${aiVerdictLabel(verdict)}',
         category: item.category,
         about: item.about,
         at: now,
       );
     }
     await _writeKnown(known);
+    if (sites.isNotEmpty) {
+      await _removeRulesFor(ref, sites);
+    }
     if (toApply.isNotEmpty) {
       await applyRules(ref, toApply, tag: '你确认的');
     }
@@ -1139,6 +1320,7 @@ class AiDaily {
         if (!done.contains(item.rule.raw)) item.toJson(),
     ];
     await _writeState(state);
+    return skipped;
   }
 
   /// [verdict] is DIRECT, PROXY, BLOCK, KEEP, or FORGET to have the next
