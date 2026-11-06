@@ -16,6 +16,7 @@ extension PageLabelL10n on PageLabel {
       PageLabel.requests => appLocalizations.requests,
       PageLabel.resources => appLocalizations.resources,
       PageLabel.dns => appLocalizations.dnsQueries,
+      PageLabel.ai => 'AI',
     };
   }
 }

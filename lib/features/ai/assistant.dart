@@ -845,6 +845,82 @@ class AiClient {
         : AiException('找不到模型「${settings.model}」，请在设置里换一个模型名。');
   }
 
+  /// One turn of a tool-using conversation: the assistant message, which may
+  /// carry tool_calls instead of text.
+  static Future<Map<String, dynamic>> chat(
+    AiSettings settings, {
+    required List<Map<String, Object?>> messages,
+    required List<Map<String, Object?>> tools,
+  }) async {
+    final models = [
+      settings.model,
+      if (settings.model == AiSettings.defaultModel)
+        ...AiSettings.fallbackModels,
+    ];
+    DioException? last;
+    for (final model in models) {
+      try {
+        final dio = Dio(
+          BaseOptions(
+            connectTimeout: const Duration(seconds: 20),
+            receiveTimeout: const Duration(seconds: 120),
+            sendTimeout: const Duration(seconds: 30),
+          ),
+        );
+        final response = await dio.post<Map<String, dynamic>>(
+          '${_base(settings)}/chat/completions',
+          data: {'model': model, 'messages': messages, 'tools': tools},
+          options: Options(
+            responseType: ResponseType.json,
+            headers: {'Authorization': 'Bearer ${settings.apiKey}'},
+          ),
+        );
+        final choices = response.data?['choices'];
+        if (choices is List && choices.isNotEmpty) {
+          final message = (choices.first as Map)['message'];
+          if (message is Map) {
+            return Map<String, dynamic>.from(message);
+          }
+        }
+        throw const AiException('AI 没有给出回答，请再试一次。');
+      } on DioException catch (error) {
+        last = error;
+        if (!_isModelMissing(error)) {
+          throw _explain(error);
+        }
+      }
+    }
+    throw last == null
+        ? const AiException('AI 没有给出回答，请再试一次。')
+        : AiException('找不到模型「${settings.model}」，请在设置里换一个模型名。');
+  }
+
+  static String _base(AiSettings settings) => settings.baseUrl.endsWith('/')
+      ? settings.baseUrl.substring(0, settings.baseUrl.length - 1)
+      : settings.baseUrl;
+
+  /// Whether the AI endpoint answers at all through the current routing: any
+  /// HTTP status counts, only a network failure does not.
+  static Future<bool> reachable(AiSettings settings) async {
+    try {
+      await Dio(
+        BaseOptions(
+          connectTimeout: const Duration(seconds: 8),
+          receiveTimeout: const Duration(seconds: 8),
+        ),
+      ).get<void>(
+        '${_base(settings)}/models',
+        options: Options(
+          headers: {'Authorization': 'Bearer ${settings.apiKey}'},
+          validateStatus: (_) => true,
+        ),
+      );
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   static Map<String, Object?> parseJson(String content) {
     var text = content.trim();
     final start = text.indexOf('{');
